@@ -8,6 +8,7 @@ import { useWallet } from '@/hooks/use-wallet'
 import { useLiveTrading } from '@/hooks/use-live-trading'
 import { usePaperTrading } from '@/hooks/use-paper-trading'
 import { ModeToggle, type TradingMode } from '@/components/trading/ModeToggle'
+import { BotTabs } from '@/components/trading/BotTabs'
 import { WalletConnect } from '@/components/trading/WalletConnect'
 import { LiveTradingPanel } from '@/components/trading/LiveTradingPanel'
 import { LiveTradeFeed } from '@/components/trading/LiveTradeFeed'
@@ -93,6 +94,12 @@ function DashboardInner() {
 
         <main className="flex-1">
           <div className="mx-auto w-full max-w-7xl space-y-4 p-4 md:space-y-6 md:p-6">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <BotTabs />
+              <p className="text-[11px] text-muted-foreground">
+                Jupiter Bot &middot; Solana arb &middot; real Jup.ag data
+              </p>
+            </div>
             <ModeToggle mode={mode} setMode={setMode} />
 
             {/* 2-column layout: panel left, wallet+positions+equity right */}
@@ -156,6 +163,12 @@ function DashboardInner() {
 
       <main className="flex-1">
         <div className="mx-auto w-full max-w-7xl space-y-4 p-4 md:space-y-6 md:p-6">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <BotTabs />
+            <p className="text-[11px] text-muted-foreground">
+              Jupiter Bot &middot; Solana arb &middot; real Jup.ag data
+            </p>
+          </div>
           <ModeToggle mode={mode} setMode={setMode} />
 
           {/* 2-column: paper control panel (left) + positions + equity (right) */}

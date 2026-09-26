@@ -55,6 +55,16 @@ export function fmtDuration(ms: number): string {
   return `${sec}s`
 }
 
+export function fmtEth(n: number, digits = 4): string {
+  if (!isFinite(n)) return "0 ETH"
+  return `${n.toFixed(digits)} ETH`
+}
+
+export function fmtEthUsd(n: number, ethUsd = 3247.18): string {
+  if (!isFinite(n)) return "$0.00"
+  return fmtUsd(n * ethUsd)
+}
+
 export function shortMint(mint: string): string {
   if (!mint) return ""
   if (mint.length <= 10) return mint

@@ -10,7 +10,12 @@ import {
   Lock,
   Radar,
   ShieldCheck,
+  Ship,
   Sparkles,
+  ChartNoAxesCombined,
+  Bitcoin,
+  Gem,
+  Rocket,
   TrendingUp,
   Wallet,
   Zap,
@@ -210,6 +215,48 @@ export default function MarketingPage() {
           <nav className="hidden items-center gap-8 text-sm text-muted-foreground md:flex">
             <a href="#features" className="transition-colors hover:text-foreground">
               Features
+            </a>
+            <a
+              href="/dashboard/seabot"
+              className="flex items-center gap-1.5 transition-colors hover:text-foreground"
+            >
+              <Ship className="size-3.5" />
+              SeaBot
+            </a>
+            <a
+              href="/dashboard/curve"
+              className="flex items-center gap-1.5 transition-colors hover:text-foreground"
+            >
+              <ChartNoAxesCombined className="size-3.5" />
+              Curve Finance
+            </a>
+            <a
+              href="/dashboard/binance"
+              className="flex items-center gap-1.5 transition-colors hover:text-foreground"
+            >
+              <Bitcoin className="size-3.5" />
+              Binance
+            </a>
+            <a
+              href="/dashboard/bitcoin"
+              className="flex items-center gap-1.5 transition-colors hover:text-foreground"
+            >
+              <Bitcoin className="size-3.5" />
+              Bitcoin
+            </a>
+            <a
+              href="/dashboard/eth"
+              className="flex items-center gap-1.5 transition-colors hover:text-foreground"
+            >
+              <Gem className="size-3.5" />
+              Eth
+            </a>
+            <a
+              href="/dashboard/pumpfun"
+              className="flex items-center gap-1.5 transition-colors hover:text-foreground"
+            >
+              <Rocket className="size-3.5" />
+              PumpFun
             </a>
             <a href="#how-it-works" className="transition-colors hover:text-foreground">
               How it works
