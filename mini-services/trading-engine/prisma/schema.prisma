@@ -1,0 +1,91 @@
+// Jupiter Solana Trading Bot - Prisma schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Bot configuration (single row, id = "default")
+model BotConfig {
+  id              String   @id @default("default")
+  running         Boolean  @default(false)
+  capital         Float    @default(1000) // starting USDC balance
+  maxPositions    Int      @default(5)
+  tradeSizePct    Float    @default(10) // % of available balance per trade
+  buyThreshold    Float    @default(1.5) // % deviation below SMA to trigger BUY
+  sellThreshold   Float    @default(1.5) // % profit above entry to trigger SELL
+  stopLossPct     Float    @default(3) // % loss to close position
+  arbMinProfitBps Int      @default(40) // min arbitrage profit in bps (0.4%)
+  slippageBps     Int      @default(50)
+  scanIntervalMs  Int      @default(4000)
+  tokens          String   @default("[]") // JSON array of token mints to trade
+  updatedAt       DateTime @updatedAt
+}
+
+// Completed (closed) trades
+model Trade {
+  id            String    @id @default(cuid())
+  strategy      String    // "mean_reversion" | "arbitrage"
+  side          String    // "BUY" | "SELL" | "ARB"
+  inputMint     String
+  outputMint    String
+  inputSymbol   String
+  outputSymbol  String
+  inputAmount   Float
+  outputAmount  Float
+  entryPrice    Float
+  exitPrice     Float?
+  pnl           Float     @default(0)
+  pnlPct        Float     @default(0)
+  win           Boolean   @default(false)
+  route         String    @default("[]") // JSON of route legs
+  cycle         String? // JSON cycle path for arbitrage
+  reason        String    @default("")
+  openedAt      DateTime  @default(now())
+  closedAt      DateTime?
+
+  @@index([strategy])
+  @@index([openedAt])
+  @@index([win])
+}
+
+// Open positions (mean reversion)
+model Position {
+  id           String   @id @default(cuid())
+  mint         String
+  symbol       String
+  entryPrice   Float
+  amount       Float // token amount held
+  costUsd      Float
+  smaAtEntry   Float
+  openedAt     DateTime @default(now())
+
+  @@index([mint])
+}
+
+// Equity curve snapshots (for P&L chart)
+model EquityPoint {
+  id        String   @id @default(cuid())
+  equity    Float
+  balance   Float
+  openPnl   Float
+  timestamp DateTime @default(now())
+
+  @@index([timestamp])
+}
+
+// Price tick history (for charts + strategy)
+model PriceTick {
+  id        String   @id @default(cuid())
+  mint      String
+  symbol    String
+  price     Float
+  source    String   @default("jupiter")
+  timestamp DateTime @default(now())
+
+  @@index([mint, timestamp])
+}
