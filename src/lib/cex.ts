@@ -227,6 +227,8 @@ export async function krakenGetBalances(cred: ExchangeCredentials): Promise<Exch
   }))
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
 export interface KrakenOrderOpts {
   cred: ExchangeCredentials
   pair: string // canonical pair, e.g. "XXBTZUSD"
@@ -234,6 +236,8 @@ export interface KrakenOrderOpts {
   volume: number // base asset volume
   ordertype?: "market" | "limit"
   price?: number // required when ordertype === 'limit'
+  /** How long to wait for Kraken to report the fill (default 15s). */
+  fillTimeoutMs?: number
 }
 
 export interface KrakenOrderFilters {
@@ -301,23 +305,44 @@ export async function krakenMarketOrder(opts: KrakenOrderOpts): Promise<Exchange
 
   // AddOrder only acknowledges the order. Query it so callers get the real
   // filled volume and cost instead of assuming the whole amount filled.
+  // Kraken fills asynchronously, so a single immediate read usually returns
+  // zero; poll until the order stops reporting a partial execution.
   let executedQty = 0
   let executedQuote = 0
   let price = 0
-  try {
-    const q = (await krakenSignedPost("/0/private/QueryOrders", { txid }, opts.cred)) as Record<
-      string,
-      { vol_exec?: string; cost?: string; price?: string; status?: string }
-    >
-    const o = q[txid]
-    if (o) {
-      executedQty = parseFloat(o.vol_exec ?? "0") || 0
-      executedQuote = parseFloat(o.cost ?? "0") || 0
-      price = parseFloat(o.price ?? "0") || 0
+  const deadline = Date.now() + (opts.fillTimeoutMs ?? 15_000)
+  for (;;) {
+    try {
+      const q = (await krakenSignedPost("/0/private/QueryOrders", { txid }, opts.cred)) as Record<
+        string,
+        { vol_exec?: string; cost?: string; price?: string; status?: string; vol?: string }
+      >
+      const o = q[txid]
+      if (o) {
+        const volExec = parseFloat(o.vol_exec ?? "0") || 0
+        // A closed/cancelled order is final: stop waiting and report what filled.
+        const status = (o.status ?? "").toLowerCase()
+        if (status === "closed" || status === "canceled" || status === "expired") {
+          executedQty = volExec
+          executedQuote = parseFloat(o.cost ?? "0") || 0
+          price = parseFloat(o.price ?? "0") || 0
+          break
+        }
+        if (volExec > 0) {
+          executedQty = volExec
+          executedQuote = parseFloat(o.cost ?? "0") || 0
+          price = parseFloat(o.price ?? "0") || 0
+          // Fully filled: nothing left to wait for.
+          if (volExec >= (parseFloat(o.vol ?? "0") || 0) - 1e-12) break
+        }
+      }
+    } catch {
+      // Order placed but not verifiable — report zero fills so the bot halts
+      // rather than assuming a position it cannot confirm.
+      break
     }
-  } catch {
-    // Order placed but not verifiable — report zero fills so the bot halts
-    // rather than assuming a position it cannot confirm.
+    if (Date.now() >= deadline) break
+    await sleep(700)
   }
   if (price > 0 && executedQty > 0 && executedQuote === 0) {
     executedQuote = price * executedQty

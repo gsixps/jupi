@@ -115,29 +115,67 @@ export function BotsProvider({ children }: { children: React.ReactNode }) {
   const coinEth = useCoinBot('eth')
   const bybit = useBybitBot()
 
-  const status = useMemo<BotStatusMap>(() => {
-    const flags = (
-      enabled: boolean,
-      real: boolean,
-      label: string
-    ): BotStatus => ({ running: enabled, real: enabled && real, label })
+  // Coarse primitives for the tab bar. Reading them here keeps the memo below
+  // from depending on the bot objects, whose identity changes on every tick.
+  const flags = (
+    enabled: boolean,
+    real: boolean,
+    label: string
+  ): BotStatus => ({ running: enabled, real: enabled && real, label })
+  const paperEnabled = paper.enabled
+  const liveEnabled = live.enabled
+  const binanceEnabled = binance.enabled
+  const binanceLive = binance.config.liveTrading
+  const krakenEnabled = kraken.enabled
+  const krakenLive = kraken.config.liveTrading
+  const curveEnabled = curve.enabled
+  const curveLive = curve.config.liveTrading
+  const seabotEnabled = seabot.enabled
+  const seabotLive = seabot.config.liveTrading
+  const pumpfunEnabled = pumpfun.enabled
+  const pumpfunLive = pumpfun.config.liveTrading
+  const btcEnabled = coinBtc.enabled
+  const btcLive = coinBtc.liveTrading
+  const ethEnabled = coinEth.enabled
+  const ethLive = coinEth.liveTrading
+  const bybitEnabled = bybit.enabled
+  const bybitLive = bybit.config.liveTrading
 
-    return {
-      jupiter: flags(
-        paper.enabled || live.enabled,
-        live.enabled,
-        'Jupiter Bot'
-      ),
-      binance: flags(binance.enabled, binance.config.liveTrading, 'Binance'),
-      kraken: flags(kraken.enabled, kraken.config.liveTrading, 'Kraken'),
-      curve: flags(curve.enabled, curve.config.liveTrading, 'Curve Finance'),
-      seabot: flags(seabot.enabled, seabot.config.liveTrading, 'SeaBot'),
-      pumpfun: flags(pumpfun.enabled, pumpfun.config.liveTrading, 'PumpFun'),
-      bitcoin: flags(coinBtc.enabled, coinBtc.liveTrading, 'Bitcoin'),
-      eth: flags(coinEth.enabled, coinEth.liveTrading, 'Eth'),
-      bybit: flags(bybit.enabled, bybit.config.liveTrading, 'Bybit RWA'),
-    }
-  }, [paper.enabled, live.enabled, binance, kraken, curve, seabot, pumpfun, coinBtc, coinEth, bybit])
+  // Depend on the primitive flags only. Depending on the bot objects would
+  // rebuild this map on every price tick and re-render the tab bar constantly.
+  const status = useMemo<BotStatusMap>(
+    () => ({
+      jupiter: flags(paperEnabled || liveEnabled, liveEnabled, 'Jupiter Bot'),
+      binance: flags(binanceEnabled, binanceLive, 'Binance'),
+      kraken: flags(krakenEnabled, krakenLive, 'Kraken'),
+      curve: flags(curveEnabled, curveLive, 'Curve Finance'),
+      seabot: flags(seabotEnabled, seabotLive, 'SeaBot'),
+      pumpfun: flags(pumpfunEnabled, pumpfunLive, 'PumpFun'),
+      bitcoin: flags(btcEnabled, btcLive, 'Bitcoin'),
+      eth: flags(ethEnabled, ethLive, 'Eth'),
+      bybit: flags(bybitEnabled, bybitLive, 'Bybit RWA'),
+    }),
+    [
+      paperEnabled,
+      liveEnabled,
+      binanceEnabled,
+      binanceLive,
+      krakenEnabled,
+      krakenLive,
+      curveEnabled,
+      curveLive,
+      seabotEnabled,
+      seabotLive,
+      pumpfunEnabled,
+      pumpfunLive,
+      btcEnabled,
+      btcLive,
+      ethEnabled,
+      ethLive,
+      bybitEnabled,
+      bybitLive,
+    ]
+  )
 
   return (
     <walletCtx.Ctx.Provider value={wallet}>

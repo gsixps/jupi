@@ -36,9 +36,10 @@ import {
   bybitRoundQuote,
   bybitUsdtFree,
   loadCreds,
-  type ExchangeBalance,
-  type ExchangeCredentials,
-} from '@/lib/cex'
+    type ExchangeBalance,
+    type ExchangeCredentials,
+    type BybitInstrumentFilters,
+  } from '@/lib/cex'
 import type { EquityPoint } from '@/lib/trading-types'
 
 const PRICE_HISTORY_CAP = 60
@@ -197,6 +198,71 @@ function expectedProfitUsd(notional: number, entryBasisBps: number, exitBasisBps
   const converge = Math.abs(entryBasisBps) - exitBasisBps
   if (converge <= 0) return 0
   return (notional * converge) / 10000
+}
+
+/**
+ * Reverse an already-filled spot leg after the hedge leg failed, so a failed
+ * hedge does not leave a naked position behind. Best effort by design: the
+ * caller always halts afterwards and reports the outcome.
+ */
+async function unwindSpotLeg(opts: {
+  cred: ExchangeCredentials
+  symbol: string
+  /** Side of the spot order that filled and now has to be reversed. */
+  side: 'buy' | 'sell'
+  /** Base quantity that actually filled. */
+  filledBaseQty: number
+  spotF: BybitInstrumentFilters
+}): Promise<{ ok: boolean; orderId?: string; error?: string }> {
+  const qty = bybitRoundQty(opts.filledBaseQty, opts.spotF)
+  if (qty <= 0) return { ok: false, error: 'cantidad de reversión redondeada a 0' }
+  try {
+    // Reversing a buy means selling what we just bought, and vice versa.
+    const back = await bybitMarketOrder({
+      cred: opts.cred,
+      category: 'spot',
+      symbol: opts.symbol,
+      side: opts.side === 'buy' ? 'Sell' : 'Buy',
+      qty,
+      marketUnit: 'baseCoin',
+    })
+    if (back.executedQty <= 0) {
+      return { ok: false, orderId: back.orderId, error: `reversión sin fills (${back.orderId})` }
+    }
+    return { ok: true, orderId: back.orderId }
+  } catch (e) {
+    return { ok: false, error: (e as Error).message }
+  }
+}
+
+/**
+ * Re-open a perp leg that was just closed with reduceOnly because the spot leg
+ * then failed. Restoring the hedge leaves the account flat-neutral instead of
+ * silently short. Best effort: the caller always halts and reports.
+ */
+async function restorePerpHedge(opts: {
+  cred: ExchangeCredentials
+  symbol: string
+  /** Side of the perp leg that was closed — re-open it with the same side. */
+  side: 'buy' | 'sell'
+  qty: number
+}): Promise<{ ok: boolean; orderId?: string; error?: string }> {
+  if (!(opts.qty > 0)) return { ok: false, error: 'cantidad de perp en 0' }
+  try {
+    const back = await bybitMarketOrder({
+      cred: opts.cred,
+      category: 'linear',
+      symbol: opts.symbol,
+      side: opts.side === 'buy' ? 'Buy' : 'Sell',
+      qty: opts.qty,
+    })
+    if (back.executedQty <= 0) {
+      return { ok: false, orderId: back.orderId, error: `reapertura sin fills (${back.orderId})` }
+    }
+    return { ok: true, orderId: back.orderId }
+  } catch (e) {
+    return { ok: false, error: (e as Error).message }
+  }
 }
 
 export function useBybitBot() {
@@ -374,8 +440,17 @@ export function useBybitBot() {
               marketUnit: 'baseCoin',
             })
             if (spotClose.executedQty <= 0) {
+              const restored = await restorePerpHedge({
+                cred,
+                symbol: h.perpSymbol,
+                side: h.perpSide,
+                qty: perpQty,
+              })
               halt(
-                `cierre de ${h.token}: la pata spot SELL ${h.spotSymbol} no fills (orden ${spotClose.orderId})`
+                `cierre de ${h.token}: la pata spot SELL ${h.spotSymbol} no fills (orden ${spotClose.orderId}); ` +
+                  (restored.ok
+                    ? `se restauró la cobertura perp (orden ${restored.orderId})`
+                    : `ATENCIÓN: no se pudo restaurar la cobertura perp (${restored.error})`)
               )
               return
             }
@@ -390,8 +465,17 @@ export function useBybitBot() {
               marketUnit: 'quoteCoin',
             })
             if (spotClose.executedQty <= 0) {
+              const restored = await restorePerpHedge({
+                cred,
+                symbol: h.perpSymbol,
+                side: h.perpSide,
+                qty: perpQty,
+              })
               halt(
-                `cierre de ${h.token}: la pata spot BUY ${h.spotSymbol} no fills (orden ${spotClose.orderId})`
+                `cierre de ${h.token}: la pata spot BUY ${h.spotSymbol} no fills (orden ${spotClose.orderId}); ` +
+                  (restored.ok
+                    ? `se restauró la cobertura perp (orden ${restored.orderId})`
+                    : `ATENCIÓN: no se pudo restaurar la cobertura perp (${restored.error})`)
               )
               return
             }
@@ -491,7 +575,8 @@ export function useBybitBot() {
           }
 
           const perpQty = bybitRoundQty(notional / r.perpUsd, perpF)
-          if (perpQty < (perpF.minOrderQty || 0)) {            log(
+          if (perpQty < (perpF.minOrderQty || 0)) {
+            log(
               `Omitido ${r.token}: ${perpQty} ${r.token} por debajo del mínimo de ${r.perpSymbol} (${perpF.minOrderQty})`,
               'warn'
             )
@@ -527,16 +612,38 @@ export function useBybitBot() {
             qty: perpQty,
           })
           if (perpOrder.executedQty <= 0) {
+            // The spot leg is live and the hedge is not. Unwind the spot leg
+            // before halting so the account is not left with a naked position.
+            const unwind = await unwindSpotLeg({
+              cred,
+              symbol: r.spotSymbol,
+              side: spotSide,
+              filledBaseQty:
+                spotOrder.executedQuote > 0 && spotOrder.price > 0
+                  ? spotOrder.executedQuote / spotOrder.price
+                  : spotOrder.executedQty,
+              spotF,
+            })
             halt(
-              `la pata perp ${perpOrder.side} ${r.perpSymbol} no fills (orden ${perpOrder.orderId}); la pata spot quedó sin cobertura`
+              `la pata perp ${perpSide === 'buy' ? 'BUY' : 'SELL'} ${r.perpSymbol} no fills (orden ${perpOrder.orderId}); ` +
+                (unwind.ok
+                  ? `la pata spot se revirtió (orden ${unwind.orderId})`
+                  : `ATENCIÓN: la pata spot NO se pudo revertir (${unwind.error ?? 'sin orden'}) — posición sin cubrir`)
             )
             return
           }
           const bals2 = await bybitGetBalances(cred)
           cash = bybitUsdtFree(bals2)
-          // Book only what actually filled.
+          // Book only what actually filled. The spot buy was sent in USDT
+          // (quoteCoin), so its base quantity comes from the quote actually
+          // spent divided by the average price — not from cumExecQty, which is
+          // reported in the order's own market unit.
           bookedSpotQty =
-            spotSide === 'buy' ? spotOrder.executedQty / (spotOrder.price || 1) : 0
+            spotSide === 'buy'
+              ? spotOrder.executedQuote > 0 && spotOrder.price > 0
+                ? spotOrder.executedQuote / spotOrder.price
+                : spotOrder.executedQty
+              : 0
           bookedPerpQty = perpOrder.executedQty
           bookedOrderId = spotOrder.orderId
           bookedPerpOrderId = perpOrder.orderId

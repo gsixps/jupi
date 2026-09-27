@@ -291,9 +291,18 @@ export function useCoinBot(assetKey: 'btc' | 'eth') {
       if (liveErr) log(`${symbol} API no disponible — usando motor demo determinista`, 'warn')
 
       // 2. Compute prices
-      let cheapest = rows[0]
-      let dearest = rows[0]
-      for (const r of rows) {
+      // LIVE: only USDT-quoted pairs are tradable. The bot mirrors the real
+      // USDT balance, so buying on a FDUSD/USDC pair would spend an asset whose
+      // inventory was never checked, and selling on one would credit cash the
+      // account may not hold.
+      const tradable = s0.liveTrading ? rows.filter((r) => r.quote === 'USDT') : rows
+      let cheapest = tradable[0]
+      let dearest = tradable[0]
+      if (!cheapest || !dearest) {
+        log(`${symbol}: sin pares cotizados en USDT — se omite el trading en live`, 'warn')
+        return
+      }
+      for (const r of tradable) {
         if (r.priceUsd < cheapest.priceUsd) cheapest = r
         if (r.priceUsd > dearest.priceUsd) dearest = r
       }
@@ -355,6 +364,22 @@ export function useCoinBot(assetKey: 'btc' | 'eth') {
             const qty = h.realQty ?? 0
             if (!(qty > 0)) {
               halt(`posición ${symbol} sin cantidad real registrada; no se puede cerrar`)
+              return
+            }
+            // Inventory check: never send a sell for coins the account does not
+            // actually hold (manual withdrawals, previous page reload, etc).
+            let freeBase = 0
+            try {
+              const bals = await binanceGetBalances(cred)
+              freeBase = bals.find((b) => b.symbol === symbol)?.free ?? 0
+            } catch (e) {
+              halt(`no se pudo verificar el inventario de ${symbol}: ${(e as Error).message}`)
+              return
+            }
+            if (freeBase + 1e-12 < qty) {
+              halt(
+                `inventario insuficiente de ${symbol}: la cuenta tiene ${freeBase} y la posición necesita ${qty}`
+              )
               return
             }
             let order
