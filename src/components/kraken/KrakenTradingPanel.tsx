@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
-  Bitcoin,
+  Anchor,
   Loader2,
   Pause,
   Play,
@@ -40,11 +40,11 @@ import {
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
 import { Switch } from '@/components/ui/switch'
-import type { CoinBot } from '@/hooks/use-coin'
+import type { useKrakenBot } from '@/hooks/use-kraken'
 import { fmtUsd, fmtTime, fmtPct, fmtDuration, fmtBps } from '@/lib/format'
 
-interface CoinTradingPanelProps {
-  bot: CoinBot
+interface KrakenTradingPanelProps {
+  kraken: ReturnType<typeof useKrakenBot>
 }
 
 interface NumericControl {
@@ -52,22 +52,30 @@ interface NumericControl {
     | 'budgetPerTradeUsd'
     | 'maxHoldings'
     | 'minSpreadBps'
-    | 'targetPct'
-    | 'stopLossPct'
-    | 'trailingPct'
+    | 'stopLossBps'
+    | 'trailingBps'
     | 'tickIntervalMs'
   label: string
   min: number
   max: number
   step: number
-  format?: (v: number) => string
   unit?: string
+  format?: (v: number) => string
 }
+
+const CONTROLS: NumericControl[] = [
+  { key: 'budgetPerTradeUsd', label: 'Budget per arb', min: 1, max: 100000, step: 5, format: (v) => fmtUsd(v) },
+  { key: 'maxHoldings', label: 'Max open arbs', min: 1, max: 20, step: 1 },
+  { key: 'minSpreadBps', label: 'Min divergence', min: 1, max: 50, step: 1, unit: 'bps', format: (v) => fmtBps(v) },
+  { key: 'stopLossBps', label: 'Stop-loss', min: 1, max: 50, step: 1, unit: 'bps', format: (v) => fmtBps(v) },
+  { key: 'trailingBps', label: 'Trailing stop', min: 0, max: 50, step: 1, unit: 'bps', format: (v) => (v === 0 ? 'off' : fmtBps(v)) },
+  { key: 'tickIntervalMs', label: 'Scan interval', min: 3000, max: 20000, step: 500, unit: 'ms', format: (v) => `${(v / 1000).toFixed(1)}s` },
+]
 
 function StatusBadge({ status }: { status: string }) {
   const map: Record<string, { label: string; cls: string; icon: React.ReactNode }> = {
     idle: { label: 'Idle', cls: 'border-zinc-500/40 bg-zinc-500/10 text-zinc-300', icon: <Pause className="size-3" /> },
-    scanning: { label: 'Scanning', cls: 'border-amber-500/40 bg-amber-500/10 text-amber-300', icon: <Radio className="size-3 animate-pulse" /> },
+    scanning: { label: 'Scanning', cls: 'border-teal-500/40 bg-teal-500/10 text-teal-300', icon: <Radio className="size-3 animate-pulse" /> },
     executing: { label: 'Executing', cls: 'border-violet-500/40 bg-violet-500/10 text-violet-300', icon: <Loader2 className="size-3 animate-spin" /> },
     paused: { label: 'Paused', cls: 'border-cyan-500/40 bg-cyan-500/10 text-cyan-300', icon: <Pause className="size-3" /> },
   }
@@ -110,13 +118,34 @@ function StatTile({
   )
 }
 
-function TradeRow({ t, symbol }: { t: CoinBot['trades'][number]; symbol: string }) {
+function SideBadge({ type }: { type: 'buy' | 'sell' }) {
+  if (type === 'buy') {
+    return (
+      <Badge
+        variant="outline"
+        className="border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+      >
+        BUY
+      </Badge>
+    )
+  }
+  return (
+    <Badge
+      variant="outline"
+      className="border-rose-500/40 bg-rose-500/10 text-rose-300"
+    >
+      SELL
+    </Badge>
+  )
+}
+
+function TradeRow({ t }: { t: ReturnType<typeof useKrakenBot>['trades'][number] }) {
   const isSell = t.type === 'sell'
   const win = t.pnlUsd >= 0
   return (
     <motion.div
       layout
-      initial={{ opacity: 0, y: -8, backgroundColor: isSell ? 'rgba(16,185,129,0.10)' : 'rgba(245,158,11,0.10)' }}
+      initial={{ opacity: 0, y: -8, backgroundColor: isSell ? 'rgba(16,185,129,0.10)' : 'rgba(20,184,166,0.10)' }}
       animate={{ opacity: 1, y: 0, backgroundColor: 'rgba(0,0,0,0)' }}
       transition={{ duration: 0.35 }}
       className="flex flex-wrap items-center gap-2 border-b border-border/60 px-3 py-2 text-sm last:border-0"
@@ -124,34 +153,24 @@ function TradeRow({ t, symbol }: { t: CoinBot['trades'][number]; symbol: string 
       <div className="w-14 shrink-0 text-xs text-muted-foreground tabular-nums">
         {fmtTime(t.createdAt)}
       </div>
-      <div className="hidden w-12 shrink-0 sm:block">
-        <Badge
-          variant="outline"
-          className={
-            isSell
-              ? 'border-rose-500/40 bg-rose-500/10 text-rose-300'
-              : 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
-          }
-        >
-          {isSell ? 'SELL' : 'BUY'}
-        </Badge>
+      <div className="hidden w-14 shrink-0 sm:block">
+        <SideBadge type={t.type} />
       </div>
       <div className="flex min-w-0 flex-1 flex-col items-start gap-0.5">
         <div className="flex items-center gap-1 text-xs">
-          <span className="font-medium">{symbol}</span>
-          <span className="tabular-nums text-muted-foreground">{t.qty.toFixed(6)}</span>
-          <span className="text-muted-foreground">@{t.pair}</span>
+          <span className="font-medium">{t.token}</span>
+          <span className="text-muted-foreground">{t.routeName}</span>
         </div>
         <span className="max-w-full truncate text-[10px] text-muted-foreground">
           {t.reason}
         </span>
       </div>
       <div className="hidden w-20 shrink-0 text-right text-xs tabular-nums text-muted-foreground sm:block">
-        {fmtUsd(t.priceUsd, 2)}
+        {fmtUsd(t.priceUsd, 6)}
       </div>
       <div
         className={`flex w-28 shrink-0 items-center justify-end gap-1 text-xs font-semibold tabular-nums ${
-          isSell ? (win ? 'text-emerald-400' : 'text-rose-400') : 'text-amber-300'
+          isSell ? (win ? 'text-emerald-400' : 'text-rose-400') : 'text-teal-300'
         }`}
       >
         {isSell ? (
@@ -179,56 +198,38 @@ function TradeRow({ t, symbol }: { t: CoinBot['trades'][number]; symbol: string 
   )
 }
 
-export function CoinTradingPanel({ bot }: CoinTradingPanelProps) {
+export function KrakenTradingPanel({ kraken }: KrakenTradingPanelProps) {
   const [confirmedThisSession, setConfirmedThisSession] = useState(false)
-  const [capitalInput, setCapitalInput] = useState(String(bot.capitalUsd))
+  const [capitalInput, setCapitalInput] = useState(String(kraken.config.capitalUsd))
 
-  const stats = bot.stats
-  const equity = stats?.equityUsd ?? bot.capitalUsd
+  const stats = kraken.stats
+  const equity = stats?.equityUsd ?? kraken.config.capitalUsd
   const realized = stats?.realizedPnlUsd ?? 0
   const winRate = stats?.winRate ?? 0
-  const openHoldings = bot.holdings.filter((h) => h.status === 'open').length
+  const openHoldings = stats?.openHoldings ?? 0
   const uptimeMs = stats?.uptimeMs ?? 0
   const pnlTone = realized >= 0 ? 'positive' : 'negative'
-  const running = bot.enabled
-  const symbol = bot.asset.symbol
-  const name = bot.asset.name
-  const storedQty = stats?.storedQty ?? 0
-  const storedUsd = stats?.bestStoredUsd ?? 0
-  const accent = bot.asset.accent
-  const btnCls =
-    accent === 'indigo'
-      ? 'bg-indigo-600 text-white hover:bg-indigo-500'
-      : 'bg-amber-600 text-white hover:bg-amber-500'
+  const running = kraken.enabled
+  const live = kraken.dataSource === 'live'
 
   const handleStart = () => {
     setConfirmedThisSession(true)
-    bot.start()
+    kraken.start()
   }
 
   const handleReset = () => {
-    bot.resetAccount()
-    setCapitalInput(String(bot.capitalUsd))
+    kraken.resetAccount()
+    setCapitalInput(String(kraken.config.capitalUsd))
   }
 
   const handleCapitalCommit = () => {
     const v = parseFloat(capitalInput)
     if (!isFinite(v) || v <= 0) {
-      setCapitalInput(String(bot.capitalUsd))
+      setCapitalInput(String(kraken.config.capitalUsd))
       return
     }
-    bot.updateConfig({ capitalUsd: v })
+    kraken.updateConfig({ capitalUsd: v })
   }
-
-  const controls: NumericControl[] = [
-    { key: 'budgetPerTradeUsd', label: 'Budget per buy', min: 1, max: 100000, step: 5, format: (v) => fmtUsd(v) },
-    { key: 'maxHoldings', label: 'Max lots', min: 1, max: 50, step: 1 },
-    { key: 'minSpreadBps', label: 'Min pair spread', min: 1, max: 30, step: 1, unit: 'bps', format: (v) => fmtBps(v) },
-    { key: 'targetPct', label: 'Take-profit', min: 0.2, max: 5, step: 0.1, unit: '%' },
-    { key: 'stopLossPct', label: 'Stop-loss', min: 0.1, max: 2, step: 0.1, unit: '%' },
-    { key: 'trailingPct', label: 'Trailing stop', min: 0, max: 2, step: 0.1, unit: '%', format: (v) => (v === 0 ? 'off' : `${v}%`) },
-    { key: 'tickIntervalMs', label: 'Scan interval', min: 3000, max: 30000, step: 1000, unit: 'ms', format: (v) => `${(v / 1000).toFixed(1)}s` },
-  ]
 
   return (
     <Card className="p-4 md:p-6">
@@ -236,17 +237,17 @@ export function CoinTradingPanel({ bot }: CoinTradingPanelProps) {
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <CardTitle className="flex items-center gap-2 text-base">
-              <Bitcoin className={`size-4 ${accent === 'indigo' ? 'text-indigo-400' : 'text-amber-400'}`} />
-              {name} Accumulation Bot
+              <Anchor className="size-4 text-teal-400" />
+              Kraken Arb Control
             </CardTitle>
             <CardDescription className="mt-1">
-              Buy cheap / sell expensive &middot; store {symbol} &middot;{' '}
-              <span className={accent === 'indigo' ? 'text-indigo-400' : 'text-amber-400'}>
-                {bot.dataSource === 'live' ? 'live binance.com API' : 'demo engine'}
+              Triangle arbitrage &middot; fictional USD &middot;{' '}
+              <span className="text-teal-400">
+                {live ? 'live api.kraken.com' : 'demo engine'}
               </span>
             </CardDescription>
           </div>
-          <StatusBadge status={bot.status} />
+          <StatusBadge status={kraken.status} />
         </div>
       </CardHeader>
 
@@ -256,41 +257,52 @@ export function CoinTradingPanel({ bot }: CoinTradingPanelProps) {
           {running ? (
             <Button
               size="lg"
-              onClick={() => bot.stop()}
-              className="gap-2 bg-amber-600 text-white hover:bg-amber-500"
+              onClick={() => kraken.stop()}
+              className="gap-2 bg-teal-600 text-white hover:bg-teal-500"
             >
-              <Square className="size-4" /> Stop {symbol} Bot
+              <Square className="size-4" /> Stop Kraken Bot
             </Button>
           ) : confirmedThisSession ? (
-            <Button size="lg" onClick={handleStart} className={`gap-2 ${btnCls}`}>
-              <Play className="size-4" /> Start {symbol} Bot
+            <Button
+              size="lg"
+              onClick={handleStart}
+              className="gap-2 bg-teal-600 text-white hover:bg-teal-500"
+            >
+              <Play className="size-4" /> Start Kraken Bot
             </Button>
           ) : (
             <AlertDialog>
               <AlertDialogTrigger asChild>
-                <Button size="lg" className={`gap-2 ${btnCls}`}>
-                  <Play className="size-4" /> Start {symbol} Bot
+                <Button
+                  size="lg"
+                  className="gap-2 bg-teal-600 text-white hover:bg-teal-500"
+                >
+                  <Play className="size-4" /> Start Kraken Bot
                 </Button>
               </AlertDialogTrigger>
               <AlertDialogContent>
                 <AlertDialogHeader>
                   <AlertDialogTitle className="flex items-center gap-2">
-                    <Bitcoin className={`size-5 ${accent === 'indigo' ? 'text-indigo-400' : 'text-amber-400'}`} />
-                    Start the {name} bot?
+                    <Anchor className="size-5 text-teal-400" />
+                    Start the Kraken arb bot?
                   </AlertDialogTitle>
                   <AlertDialogDescription>
-                    Buy {symbol} cheaply on the lowest-priced Binance pair and
-                    sell on the dearest at take-profit / stop-loss / trailing
-                    levels, accumulating coins across lots. If the API is
-                    unreachable, a deterministic demo engine takes over.
-                    Capital is fictional ({fmtUsd(bot.capitalUsd)}) — no real
-                    funds at risk.
+                    Buy cheap / sell expensive by crossing Kraken pairs: the bot
+                    detects when a token&apos;s direct USD price diverges from
+                    its implied price built from two legs (e.g. SOL/USD vs
+                    SOL/BTC × BTC/USD, or XBT/USD vs XBT/EUR × EUR/USD) and
+                    opens a triangle arb. If the API is unreachable, a
+                    deterministic demo engine takes over. Capital is fictional (
+                    {fmtUsd(kraken.config.capitalUsd)}) — no real funds at risk.
                   </AlertDialogDescription>
                 </AlertDialogHeader>
                 <AlertDialogFooter>
                   <AlertDialogCancel>Cancel</AlertDialogCancel>
-                  <AlertDialogAction onClick={handleStart} className={btnCls}>
-                    <Play className="size-4" /> Start {symbol} Bot
+                  <AlertDialogAction
+                    onClick={handleStart}
+                    className="bg-teal-600 text-white hover:bg-teal-500"
+                  >
+                    <Play className="size-4" /> Start Kraken Bot
                   </AlertDialogAction>
                 </AlertDialogFooter>
               </AlertDialogContent>
@@ -322,7 +334,7 @@ export function CoinTradingPanel({ bot }: CoinTradingPanelProps) {
                 disabled={running}
                 type="number"
                 min="0.01"
-                step="100"
+                step="0.01"
                 className="h-8 w-32 text-sm"
                 placeholder="10000"
               />
@@ -330,22 +342,57 @@ export function CoinTradingPanel({ bot }: CoinTradingPanelProps) {
           </div>
           <p className="flex-1 text-[10px] text-muted-foreground">
             Starting fictional balance in USD. Editable only while stopped —
-            changing it resets the stored coins.
+            changing it resets the cash balance.
           </p>
         </div>
 
         {/* Live stats */}
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-          <StatTile label="Equity" value={fmtUsd(equity)} sub={`Started ${fmtUsd(bot.capitalUsd)}`} />
-          <StatTile label="Realized P&L" value={fmtUsd(realized)} sub="fictional" tone={pnlTone} />
-          <StatTile label="Cash Balance" value={fmtUsd(bot.cashUsd)} sub="fictional" tone="positive" />
-          <StatTile label="Win Rate" value={`${winRate.toFixed(1)}%`} sub={`${stats?.wins ?? 0}W / ${stats?.losses ?? 0}L`} tone={winRate >= 50 ? 'positive' : 'default'} />
+          <StatTile
+            label="Equity"
+            value={fmtUsd(equity)}
+            sub={`Started ${fmtUsd(kraken.config.capitalUsd)}`}
+          />
+          <StatTile
+            label="Realized P&L"
+            value={fmtUsd(realized)}
+            sub={`${fmtUsd(realized, 4)}`}
+            tone={pnlTone}
+          />
+          <StatTile
+            label="Cash Balance"
+            value={fmtUsd(kraken.cashUsd)}
+            sub="fictional"
+            tone="positive"
+          />
+          <StatTile
+            label="Win Rate"
+            value={`${winRate.toFixed(1)}%`}
+            sub={`${stats?.wins ?? 0}W / ${stats?.losses ?? 0}L`}
+            tone={winRate >= 50 ? 'positive' : 'default'}
+          />
         </div>
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-          <StatTile label={`Stored ${symbol}`} value={`${storedQty.toFixed(6)}`} sub={fmtUsd(storedUsd)} tone="positive" />
-          <StatTile label="Open Lots" value={String(openHoldings)} sub={`Max ${bot.maxHoldings}`} />
-          <StatTile label="Total Trades" value={String(stats?.totalTrades ?? 0)} sub={`${stats?.totalTrades ?? 0} sells`} />
-          <StatTile label="Uptime" value={fmtDuration(uptimeMs)} sub={`${stats?.scanCount ?? 0} scans`} />
+          <StatTile
+            label="Open Arbs"
+            value={String(openHoldings)}
+            sub={`Max ${kraken.config.maxHoldings}`}
+          />
+          <StatTile
+            label="Invested"
+            value={fmtUsd(stats?.investedUsd ?? 0)}
+            sub="fictional"
+          />
+          <StatTile
+            label="Arbs Detected"
+            value={String(stats?.arbsDetected ?? 0)}
+            sub="this session"
+          />
+          <StatTile
+            label="Uptime"
+            value={fmtDuration(uptimeMs)}
+            sub={`${stats?.scanCount ?? 0} scans`}
+          />
         </div>
 
         <Separator />
@@ -358,14 +405,14 @@ export function CoinTradingPanel({ bot }: CoinTradingPanelProps) {
             </h3>
             <Badge
               variant="outline"
-              className={`text-[10px] ${accent === 'indigo' ? 'border-indigo-500/40 bg-indigo-500/10 text-indigo-300' : 'border-amber-500/40 bg-amber-500/10 text-amber-300'}`}
+              className="border-teal-500/40 bg-teal-500/10 text-teal-300 text-[10px]"
             >
-              buy low · sell high · accumulate
+              buy cheap · sell expensive
             </Badge>
           </div>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            {controls.map((c) => {
-              const val = bot[c.key] as number
+            {CONTROLS.map((c) => {
+              const val = kraken.config[c.key] as number
               return (
                 <div key={c.key} className="space-y-1.5">
                   <div className="flex items-center justify-between">
@@ -381,7 +428,9 @@ export function CoinTradingPanel({ bot }: CoinTradingPanelProps) {
                     min={c.min}
                     max={c.max}
                     step={c.step}
-                    onValueChange={([v]) => bot.updateConfig({ [c.key]: v } as never)}
+                    onValueChange={([v]) =>
+                      kraken.updateConfig({ [c.key]: v } as never)
+                    }
                     disabled={running}
                   />
                   {running && (
@@ -398,14 +447,14 @@ export function CoinTradingPanel({ bot }: CoinTradingPanelProps) {
                 <Label className="text-xs">Compound interest</Label>
                 <p className="text-[10px] text-muted-foreground">
                   Reinvest profits: per-trade budget scales with equity
-                  {bot.stats?.compound && bot.stats.compoundFactor > 0
-                    ? ` (×${bot.stats.compoundFactor.toFixed(2)})`
+                  {stats?.compound && stats.compoundFactor > 0
+                    ? ` (×${stats.compoundFactor.toFixed(2)})`
                     : ''}
                 </p>
               </div>
               <Switch
-                checked={bot.compound}
-                onCheckedChange={(v) => bot.updateConfig({ compound: v })}
+                checked={kraken.config.compound}
+                onCheckedChange={(v) => kraken.updateConfig({ compound: v })}
                 disabled={running}
               />
             </div>
@@ -414,33 +463,30 @@ export function CoinTradingPanel({ bot }: CoinTradingPanelProps) {
 
         <Separator />
 
-        {/* Stored coins / open lots */}
+        {/* Open arbs */}
         <div className="space-y-2">
           <div className="flex items-center justify-between">
             <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-              Stored {symbol} (open lots)
+              Open Arbitrages
             </h3>
-            <Badge
-              variant="outline"
-              className={`gap-1 text-[10px] ${accent === 'indigo' ? 'border-indigo-500/40 bg-indigo-500/10 text-indigo-300' : 'border-amber-500/40 bg-amber-500/10 text-amber-300'}`}
-            >
-              <Bitcoin className="size-3" /> {storedQty.toFixed(6)} {symbol}
+            <Badge variant="outline" className="gap-1 border-teal-500/40 bg-teal-500/10 text-teal-300 text-[10px]">
+              <Anchor className="size-3" /> {openHoldings} open
             </Badge>
           </div>
           <div className="max-h-72 overflow-y-auto scrollbar-thin rounded-md border border-border/60">
-            {openHoldings === 0 ? (
+            {kraken.holdings.filter((h) => h.status === 'open').length === 0 ? (
               <div className="flex h-24 items-center justify-center text-sm text-muted-foreground">
-                No coins stored yet — start the bot to accumulate {symbol}.
+                No open arbitrages yet — start the bot to begin.
               </div>
             ) : (
               <div>
-                {bot.holdings
+                {kraken.holdings
                   .filter((h) => h.status === 'open')
                   .slice(0, 20)
                   .map((h) => {
-                    const unrealized = (h.currentPriceUsd - h.buyPriceUsd) * h.qty
+                    const unrealized = (h.currentPrice - h.buyPrice) * (h.notionalUsd / h.buyPrice)
                     const unrealizedPct =
-                      h.buyPriceUsd > 0 ? ((h.currentPriceUsd - h.buyPriceUsd) / h.buyPriceUsd) * 100 : 0
+                      h.buyPrice > 0 ? ((h.currentPrice - h.buyPrice) / h.buyPrice) * 100 : 0
                     const up = unrealized >= 0
                     const heldMs = Date.now() - h.boughtAt
                     return (
@@ -454,19 +500,18 @@ export function CoinTradingPanel({ bot }: CoinTradingPanelProps) {
                       >
                         <div className="flex min-w-0 flex-1 flex-col">
                           <div className="flex items-center gap-1 text-xs">
-                            <span className="font-medium">{h.qty.toFixed(6)} {symbol}</span>
-                            <span className="text-muted-foreground">bought @ {h.buyPair}</span>
+                            <span className="font-medium">{h.routeName}</span>
+                            <span className="text-muted-foreground">
+                              {h.side === 'cross_cheap' ? 'via cross leg' : 'direct buy'}
+                            </span>
                           </div>
                           <span className="text-[10px] text-muted-foreground">
-                            target sell →
-                            {(h.buyPriceUsd * (1 + bot.targetPct / 100)).toFixed(2)} USD
+                            buy @ {h.buyPrice.toFixed(6)} USD → target sell @ {' '}
+                            {(h.buyPrice * (1 + kraken.config.minSpreadBps / 10000)).toFixed(6)} USD
                           </span>
                         </div>
                         <div className="hidden w-20 shrink-0 text-right text-xs tabular-nums text-muted-foreground sm:block">
-                          {fmtUsd(h.buyPriceUsd, 2)}
-                        </div>
-                        <div className="hidden w-20 shrink-0 text-right text-xs tabular-nums sm:block">
-                          {fmtUsd(h.currentPriceUsd, 2)}
+                          {fmtUsd(h.notionalUsd)}
                         </div>
                         <div
                           className={`flex w-28 shrink-0 items-center justify-end gap-1 text-xs font-semibold tabular-nums ${
@@ -475,7 +520,7 @@ export function CoinTradingPanel({ bot }: CoinTradingPanelProps) {
                         >
                           {up ? <TrendingUp className="size-3" /> : <TrendingDown className="size-3" />}
                           {`${up ? '+' : ''}${fmtUsd(unrealized, 2)}`}
-                          <span className="text-[10px] font-normal opacity-70">({fmtPct(unrealizedPct)})</span>
+                          <span className="text-[10px] font-normal opacity-70">({fmtPct(unrealizedPct, 3)})</span>
                         </div>
                         <div className="w-12 shrink-0 text-right text-[10px] text-muted-foreground">
                           {fmtDuration(heldMs)}
@@ -496,22 +541,19 @@ export function CoinTradingPanel({ bot }: CoinTradingPanelProps) {
             <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
               Recent Trades
             </h3>
-            <Badge
-              variant="outline"
-              className={`gap-1 text-[10px] ${accent === 'indigo' ? 'border-indigo-500/40 bg-indigo-500/10 text-indigo-300' : 'border-amber-500/40 bg-amber-500/10 text-amber-300'}`}
-            >
-              <Bitcoin className="size-3" /> {symbol} pairs
+            <Badge variant="outline" className="gap-1 border-teal-500/40 bg-teal-500/10 text-teal-300 text-[10px]">
+              <Anchor className="size-3" /> kraken pairs
             </Badge>
           </div>
           <div className="max-h-72 overflow-y-auto scrollbar-thin rounded-md border border-border/60">
-            {bot.trades.length === 0 ? (
+            {kraken.trades.length === 0 ? (
               <div className="flex h-24 items-center justify-center text-sm text-muted-foreground">
-                No trades yet — start the bot to begin accumulating.
+                No trades yet — start the bot to begin scanning.
               </div>
             ) : (
               <AnimatePresence initial={false}>
-                {bot.trades.slice(0, 30).map((t, i) => (
-                  <TradeRow key={`${t.id}-${i}`} t={t} symbol={symbol} />
+                {kraken.trades.slice(0, 30).map((t, i) => (
+                  <TradeRow key={`${t.id}-${i}`} t={t} />
                 ))}
               </AnimatePresence>
             )}
@@ -525,7 +567,7 @@ export function CoinTradingPanel({ bot }: CoinTradingPanelProps) {
               Engine Log
             </h3>
             <Button
-              onClick={() => bot.scan()}
+              onClick={() => kraken.scan()}
               variant="outline"
               size="sm"
               disabled={running}
@@ -536,12 +578,12 @@ export function CoinTradingPanel({ bot }: CoinTradingPanelProps) {
             </Button>
           </div>
           <div className="max-h-40 overflow-y-auto scrollbar-thin rounded-md border border-border/60 bg-black/40 p-2 font-mono text-[10px] leading-relaxed">
-            {bot.logs.length === 0 ? (
+            {kraken.logs.length === 0 ? (
               <div className="text-muted-foreground">
                 No logs yet — start the bot to begin.
               </div>
             ) : (
-              bot.logs.slice(0, 50).map((l, i) => (
+              kraken.logs.slice(0, 50).map((l, i) => (
                 <div
                   key={`${l.time}-${i}`}
                   className={
@@ -563,8 +605,8 @@ export function CoinTradingPanel({ bot }: CoinTradingPanelProps) {
 
         {!running && (
           <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-            <Zap className={`size-3 ${accent === 'indigo' ? 'text-indigo-400' : 'text-amber-400'}`} />
-            Bot stopped — Start to scan {symbol} pairs &amp; accumulate coins.
+            <Zap className="size-3 text-teal-400" />
+            Bot stopped — Start to scan Kraken pairs &amp; arb triangles.
           </div>
         )}
       </CardContent>

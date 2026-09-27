@@ -3,7 +3,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { BotTabs } from '@/components/trading/BotTabs'
-import { useCoinBot } from '@/hooks/use-coin'
+import { useCoinBtcContext } from '@/components/trading/BotsProvider'
 import { CoinHeader } from '@/components/coin/CoinHeader'
 import { CoinTradingPanel } from '@/components/coin/CoinTradingPanel'
 import { CoinMarketGrid } from '@/components/coin/CoinMarketGrid'
@@ -15,7 +15,7 @@ const queryClient = new QueryClient({
 })
 
 function BitcoinInner() {
-  const bot = useCoinBot('btc')
+  const bot = useCoinBtcContext()
 
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">

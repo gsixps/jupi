@@ -16,6 +16,8 @@ import {
   Bitcoin,
   Gem,
   Rocket,
+  Anchor,
+  Building2,
   TrendingUp,
   Wallet,
   Zap,
@@ -257,6 +259,20 @@ export default function MarketingPage() {
             >
               <Rocket className="size-3.5" />
               PumpFun
+            </a>
+            <a
+              href="/dashboard/kraken"
+              className="flex items-center gap-1.5 transition-colors hover:text-foreground"
+            >
+              <Anchor className="size-3.5" />
+              Kraken
+            </a>
+            <a
+              href="/dashboard/bybit"
+              className="flex items-center gap-1.5 transition-colors hover:text-foreground"
+            >
+              <Building2 className="size-3.5" />
+              Bybit RWA
             </a>
             <a href="#how-it-works" className="transition-colors hover:text-foreground">
               How it works

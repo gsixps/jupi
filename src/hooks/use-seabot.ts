@@ -165,6 +165,12 @@ export function useSeabot() {
           `${prefix} ${h.collectionName} ${h.tokenId} @ ${sellPrice.toFixed(4)} ETH (${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} ETH)`,
           level
         )
+        if (cfg.compound) {
+          log(
+            `⚡ Interés compuesto: capital disponible → ${fmtEthSeabot(cash)} ETH (P&L ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)})`,
+            'info'
+          )
+        }
       }
 
       // 2. SELL logic — iterate open holdings
@@ -216,6 +222,10 @@ export function useSeabot() {
         .filter((h) => h.status === 'open')
         .reduce((a, h) => a + h.currentPriceEth, 0)
       const totalCapitalUsd = (cash + investedEth) * ETH_USD_PRICE
+      // Compound interest: scale per-trade budget with grown capital
+      const compoundFactor = cfg.compound
+        ? Math.max(cash + investedEth, 0.001) / Math.max(cfg.capitalEth, 0.001)
+        : 1
 
       let buys = 0
       for (const c of collections) {
@@ -224,7 +234,7 @@ export function useSeabot() {
         if (c.floorPrice <= 0) continue
         if (totalCapitalUsd < c.minCapitalUsd) continue
 
-        const spend = Math.min(cfg.budgetPerTradeEth, cash)
+        const spend = Math.min(cfg.budgetPerTradeEth * compoundFactor, cash)
         if (spend < c.floorPrice) continue
         if (c.floorPrice > c.maxBuyPrice) continue
 
@@ -283,6 +293,8 @@ export function useSeabot() {
         openHoldings: open.length,
         scanCount: (prevStats?.scanCount ?? 0) + 1,
         lastScanAt: now,
+        compound: cfg.compound,
+        compoundFactor,
       }
       const unrealized = open.reduce((a, h) => a + (h.currentPriceEth - h.buyPriceEth), 0)
       const eqPoint: EquityPoint = {
@@ -382,4 +394,8 @@ export function useSeabot() {
     resetAccount,
     log,
   }
+}
+
+function fmtEthSeabot(n: number): string {
+  return n.toLocaleString('en-US', { minimumFractionDigits: 4, maximumFractionDigits: 4 })
 }

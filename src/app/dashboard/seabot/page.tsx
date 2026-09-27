@@ -3,7 +3,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { BotTabs } from '@/components/trading/BotTabs'
-import { useSeabot } from '@/hooks/use-seabot'
+import { useSeabotBotContext } from '@/components/trading/BotsProvider'
 import { SeabotHeader } from '@/components/seabot/SeabotHeader'
 import { SeabotTradingPanel } from '@/components/seabot/SeabotTradingPanel'
 import { SeabotMarketGrid } from '@/components/seabot/SeabotMarketGrid'
@@ -16,7 +16,7 @@ const queryClient = new QueryClient({
 })
 
 function SeabotInner() {
-  const seabot = useSeabot()
+  const seabot = useSeabotBotContext()
 
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">

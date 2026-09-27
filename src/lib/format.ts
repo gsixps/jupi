@@ -23,6 +23,17 @@ export function fmtNum(n: number, digits = 4): string {
   return n.toExponential(2)
 }
 
+/** Compact raw number formatting (no $ sign) for volumes etc. */
+export function fmtCompact(n: number): string {
+  if (!isFinite(n)) return "0"
+  const abs = Math.abs(n)
+  if (abs >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(2)}B`
+  if (abs >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`
+  if (abs >= 1_000) return `${(n / 1_000).toFixed(1)}K`
+  if (abs >= 1) return n.toFixed(2)
+  return n.toPrecision(3)
+}
+
 export function fmtPct(n: number, digits = 2): string {
   if (n == null || !isFinite(n)) return "0.00%"
   const sign = n > 0 ? "+" : ""

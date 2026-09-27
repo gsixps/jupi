@@ -134,7 +134,9 @@ export interface SeabotConfig {
   globalStopLossPct: number
   trailingStopPct: number
   tickIntervalMs: number
-  autoReinvest: boolean
+  compound: boolean // reinvest profits → per-trade budget scales with equity
+  /** Buy/sell real NFTs on-chain with a connected wallet and real ETH. */
+  liveTrading: boolean
 }
 
 export const DEFAULT_SEABOT_CONFIG: SeabotConfig = {
@@ -145,7 +147,8 @@ export const DEFAULT_SEABOT_CONFIG: SeabotConfig = {
   globalStopLossPct: 5,
   trailingStopPct: 0, // 0 = disabled
   tickIntervalMs: 8000,
-  autoReinvest: true,
+  compound: true,
+  liveTrading: false,
 }
 
 export interface SeabotStats {
@@ -164,6 +167,8 @@ export interface SeabotStats {
   openHoldings: number
   scanCount: number
   lastScanAt: number | null
+  compound: boolean
+  compoundFactor: number
 }
 
 const TOKEN_NAMES = ['#1', '#2', '#3', '#4', '#5', '#6', '#7', '#8', '#9', '#10']

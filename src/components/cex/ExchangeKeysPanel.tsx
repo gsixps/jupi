@@ -1,0 +1,232 @@
+'use client'
+
+// Reusable panel for connecting a CEX with real API keys (Binance / Kraken).
+// Keys are typed by the user and stored only in their own browser
+// (localStorage) — they are never sent to any server of ours.
+
+import { useCallback, useEffect, useState } from 'react'
+import { KeyRound, Loader2, PlugZap, ShieldCheck, Trash2 } from 'lucide-react'
+
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Separator } from '@/components/ui/separator'
+import { Switch } from '@/components/ui/switch'
+import {
+  clearCreds,
+  loadCreds,
+  saveCreds,
+  type ExchangeCredentials,
+  type ExchangeKind,
+} from '@/lib/cex'
+
+export type { ExchangeKind }
+
+interface ExchangeKeysPanelProps {
+  kind: ExchangeKind
+  /** Verify the keys against the exchange and return a human label. */
+  verify: (cred: ExchangeCredentials) => Promise<{ ok: boolean; label: string }>
+  /** Live trading mode: places real orders with real capital. */
+  liveEnabled: boolean
+  onLiveEnabledChange: (v: boolean) => void
+  /** True when the bot is currently scanning. */
+  running: boolean
+  /** Disable live mode while running so the user can't flip mid-trade. */
+  disabled?: boolean
+  onLog?: (msg: string, level?: 'info' | 'trade' | 'error') => void
+}
+
+const META: Record<ExchangeKind, { name: string; accent: string; docUrl: string }> = {
+  binance: {
+    name: 'Binance',
+    accent: 'text-amber-400',
+    docUrl: 'https://www.binance.com/en/my/settings/api-management',
+  },
+  kraken: {
+    name: 'Kraken',
+    accent: 'text-violet-400',
+    docUrl: 'https://accounts.kraken.com/settings/api',
+  },
+  bybit: {
+    name: 'Bybit',
+    accent: 'text-orange-400',
+    docUrl: 'https://www.bybit.com/app/user/api-management',
+  },
+}
+
+export function ExchangeKeysPanel({
+  kind,
+  verify,
+  liveEnabled,
+  onLiveEnabledChange,
+  running,
+  disabled,
+  onLog,
+}: ExchangeKeysPanelProps) {
+  const meta = META[kind]
+  const [apiKey, setApiKey] = useState('')
+  const [apiSecret, setApiSecret] = useState('')
+  const [hasCreds, setHasCreds] = useState(false)
+  const [showSecret, setShowSecret] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [status, setStatus] = useState<{ ok: boolean; label: string } | null>(null)
+
+  useEffect(() => {
+    setHasCreds(!!loadCreds(kind))
+    setStatus(null)
+  }, [kind])
+
+  const handleSave = useCallback(async () => {
+    const k = apiKey.trim()
+    const s = apiSecret.trim()
+    if (!k || !s) {
+      setStatus({ ok: false, label: 'Introduce API key y secret.' })
+      return
+    }
+    setBusy(true)
+    setStatus(null)
+    const cred: ExchangeCredentials = { apiKey: k, apiSecret: s }
+    try {
+      const res = await verify(cred)
+      setStatus(res)
+      if (res.ok) {
+        saveCreds(kind, cred)
+        setHasCreds(true)
+        setApiKey('')
+        setApiSecret('')
+        onLog?.(`${meta.name}: claves guardadas y verificadas.`)
+      } else {
+        onLog?.(`${meta.name}: ${res.label}`, 'error')
+      }
+    } catch (e) {
+      const msg = (e as Error).message
+      setStatus({ ok: false, label: msg.slice(0, 160) })
+      onLog?.(`${meta.name}: ${msg}`, 'error')
+    } finally {
+      setBusy(false)
+    }
+  }, [apiKey, apiSecret, kind, onLog, verify, meta.name])
+
+  const handleClear = useCallback(() => {
+    clearCreds(kind)
+    setHasCreds(false)
+    setStatus(null)
+    onLog?.(`${meta.name}: claves eliminadas del navegador.`)
+  }, [kind, onLog, meta.name])
+
+  return (
+    <div className="space-y-3 rounded-md border border-dashed border-border/60 p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="space-y-0.5">
+          <Label className="flex items-center gap-1.5 text-xs">
+            <KeyRound className="size-3.5" />
+            Conexión real {meta.name}
+          </Label>
+          <p className="text-[10px] text-muted-foreground">
+            Pega tus claves de {meta.name} para operar con capital real. Se guardan solo en
+            este navegador (localStorage) y se firman desde aquí mismo.
+          </p>
+        </div>
+        {hasCreds && (
+          <Badge variant="outline" className="gap-1 text-[10px] text-emerald-400">
+            <ShieldCheck className="size-3" /> Claves guardadas
+          </Badge>
+        )}
+      </div>
+
+      {hasCreds ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <Button size="sm" variant="outline" onClick={handleClear} disabled={busy}>
+            <Trash2 className="size-3.5" /> Borrar claves
+          </Button>
+        </div>
+      ) : (
+        <div className="grid gap-2 sm:grid-cols-2">
+          <div className="space-y-1">
+            <Label className="text-[10px] uppercase tracking-wider text-muted-foreground">
+              API key
+            </Label>
+            <Input
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              placeholder="API key"
+              className="h-8 text-xs"
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </div>
+          <div className="space-y-1">
+            <Label className="text-[10px] uppercase tracking-wider text-muted-foreground">
+              API secret
+            </Label>
+            <Input
+              value={apiSecret}
+              onChange={(e) => setApiSecret(e.target.value)}
+              placeholder="API secret"
+              type={showSecret ? 'text' : 'password'}
+              className="h-8 text-xs"
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </div>
+          <div className="flex items-center gap-3 sm:col-span-2">
+            <Button size="sm" onClick={handleSave} disabled={busy}>
+              {busy ? <Loader2 className="size-3.5 animate-spin" /> : <PlugZap className="size-3.5" />}
+              {busy ? 'Verificando…' : 'Guardar y verificar'}
+            </Button>
+            <label className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={showSecret}
+                onChange={(e) => setShowSecret(e.target.checked)}
+                className="size-3 accent-current"
+              />
+              Mostrar secret
+            </label>
+            <a
+              href={meta.docUrl}
+              target="_blank"
+              rel="noreferrer"
+              className={`text-[10px] underline underline-offset-2 ${meta.accent}`}
+            >
+              Obtener claves
+            </a>
+          </div>
+        </div>
+      )}
+
+      {status && (
+        <p
+          className={`text-[10px] ${status.ok ? 'text-emerald-400' : 'text-red-400'}`}
+        >
+          {status.label}
+        </p>
+      )}
+
+      <Separator />
+
+      <div className="flex items-center justify-between gap-2">
+        <div className="space-y-0.5">
+          <Label className="text-xs">Modo real (dinero real)</Label>
+          <p className="text-[10px] text-muted-foreground">
+            {hasCreds
+              ? 'Cada oportunidad ejecuta una orden real en el exchange. Si el exchange rechaza (mínimo, saldo), el bot se detiene y avisa.'
+              : 'Necesitas guardar y verificar las claves para activar el modo real.'}
+          </p>
+        </div>
+        <Switch
+          checked={liveEnabled && hasCreds}
+          onCheckedChange={(v) => {
+            if (!hasCreds) {
+              setStatus({ ok: false, label: 'Guarda y verifica las claves primero.' })
+              return
+            }
+            onLiveEnabledChange(v)
+          }}
+          disabled={running || disabled}
+        />
+      </div>
+    </div>
+  )
+}

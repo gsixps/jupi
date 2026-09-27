@@ -40,6 +40,7 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
+import { Switch } from '@/components/ui/switch'
 import type { useCurveBot } from '@/hooks/use-curve'
 import { fmtUsd, fmtTime, fmtPct, fmtDuration, fmtBps } from '@/lib/format'
 
@@ -64,7 +65,7 @@ interface NumericControl {
 }
 
 const CONTROLS: NumericControl[] = [
-  { key: 'budgetPerTradeUsd', label: 'Budget per arb', min: 100, max: 10000, step: 100, format: (v) => fmtUsd(v) },
+  { key: 'budgetPerTradeUsd', label: 'Budget per arb', min: 1, max: 100000, step: 5, format: (v) => fmtUsd(v) },
   { key: 'maxHoldings', label: 'Max open arbs', min: 1, max: 20, step: 1 },
   { key: 'globalTargetBps', label: 'Min spread', min: 5, max: 200, step: 5, unit: 'bps', format: (v) => fmtBps(v) },
   { key: 'stopLossBps', label: 'Stop-loss', min: 1, max: 100, step: 1, unit: 'bps', format: (v) => fmtBps(v) },
@@ -345,8 +346,8 @@ export function CurveTradingPanel({ curve }: CurveTradingPanelProps) {
                 onBlur={handleCapitalCommit}
                 disabled={running}
                 type="number"
-                min="100"
-                step="100"
+                min="0.01"
+                step="0.01"
                 className="h-8 w-32 text-sm"
                 placeholder="10000"
               />
@@ -453,6 +454,23 @@ export function CurveTradingPanel({ curve }: CurveTradingPanelProps) {
                 </div>
               )
             })}
+            {/* Compound interest toggle */}
+            <div className="flex items-center justify-between gap-2 rounded-md border border-dashed border-border/60 p-2.5 sm:col-span-2">
+              <div className="space-y-0.5">
+                <Label className="text-xs">Compound interest</Label>
+                <p className="text-[10px] text-muted-foreground">
+                  Reinvest profits: per-trade budget scales with equity
+                  {stats?.compound && stats.compoundFactor > 0
+                    ? ` (×${stats.compoundFactor.toFixed(2)})`
+                    : ''}
+                </p>
+              </div>
+              <Switch
+                checked={curve.config.compound}
+                onCheckedChange={(v) => curve.updateConfig({ compound: v })}
+                disabled={running}
+              />
+            </div>
           </div>
         </div>
 

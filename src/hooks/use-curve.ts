@@ -41,6 +41,9 @@ export interface CurveConfig {
   trailingBps: number
   tickIntervalMs: number
   dataMode: 'live' | 'mock' // 'live'=real Curve API, 'mock'=deterministic demo
+  compound: boolean // reinvest profits → per-trade budget scales with equity
+  /** Trade on-chain with a connected EVM wallet and real capital. */
+  liveTrading: boolean
 }
 
 export const DEFAULT_CURVE_CONFIG: CurveConfig = {
@@ -52,6 +55,8 @@ export const DEFAULT_CURVE_CONFIG: CurveConfig = {
   trailingBps: 4,
   tickIntervalMs: 10000,
   dataMode: 'live',
+  compound: true,
+  liveTrading: false,
 }
 
 export interface CurveHolding {
@@ -102,6 +107,8 @@ export interface CurveStats {
   scanCount: number
   lastScanAt: number
   liveData: boolean
+  compound: boolean
+  compoundFactor: number
 }
 
 export interface CurveLogEntry {
@@ -382,17 +389,29 @@ export function useCurveBot() {
             `VENDIDO ${h.coinSymbol} ${bestSell.price.toFixed(6)} USD (${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} USD, ${pnlBps >= 0 ? '+' : ''}${pnlBps}bps)`,
             'trade'
           )
+          if (cfg.compound) {
+            log(
+              `⚡ Interés compuesto: capital disponible → ${fmtUsdCurve(cash, 2)} USD (P&L ${pnl >= 0 ? '+' : ''}${fmtUsdCurve(pnl, 2)})`,
+              'info'
+            )
+          }
         } else {
           h.peakPrice = Math.max(h.peakPrice, bestSell.price)
         }
       }
 
       // 4. BUY logic — find spread ≥ target and open positions
-      const openCount = holdings.filter((h) => h.status === 'open').length
+      const openCountBefore = holdings.filter((h) => h.status === 'open').length
+      const investedBefore = holdings
+        .filter((h) => h.status === 'open')
+        .reduce((a, h) => a + h.buyPrice, 0)
+      const equityBefore = cash + investedBefore
+      // Compound interest: scale per-trade budget with grown capital
+      const compoundFactor = cfg.compound ? Math.max(equityBefore, 1) / Math.max(cfg.capitalUsd, 1) : 1
       let buys = 0
       for (const coin of coins) {
         if (coin.quotes.length < 2) continue
-        if (openCount + buys >= cfg.maxHoldings) break
+        if (openCountBefore + buys >= cfg.maxHoldings) break
         const quotes = coin.quotes
         const cheapest = quotes.reduce((a, q) => (q.price < a.price ? q : a))
         const dearest = quotes.reduce((a, q) => (q.price > a.price ? q : a))
@@ -405,8 +424,8 @@ export function useCurveBot() {
         )
         if (alreadyOpen) continue
 
-        const spend = Math.min(cfg.budgetPerTradeUsd, cash)
-        if (spend < 50) continue
+        const spend = Math.min(cfg.budgetPerTradeUsd * compoundFactor, cash)
+        if (spend < 0.01) continue
 
         holdings.unshift({
           id: `cvh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -481,6 +500,8 @@ export function useCurveBot() {
         scanCount: (prevStats?.scanCount ?? 0) + 1,
         lastScanAt: now,
         liveData: stateRef.current.dataSource === 'live',
+        compound: cfg.compound,
+        compoundFactor,
       }
       const unrealized = open.reduce((a, h) => a + (h.currentPrice ?? h.buyPrice) - h.buyPrice, 0)
       const eqPoint: EquityPoint = {
@@ -586,4 +607,11 @@ export function useCurveBot() {
     resetAccount,
     log,
   }
+}
+
+function fmtUsdCurve(n: number, d = 2): string {
+  return n.toLocaleString('en-US', {
+    minimumFractionDigits: d,
+    maximumFractionDigits: d,
+  })
 }

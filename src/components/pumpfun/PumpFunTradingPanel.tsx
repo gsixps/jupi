@@ -204,7 +204,7 @@ export function PumpFunTradingPanel({ bot }: PumpFunTradingPanelProps) {
   }
 
   const controls: NumericControl[] = [
-    { key: 'budgetPerTradeUsd', label: 'Budget per buy', min: 25, max: 2000, step: 25, format: (v) => fmtUsd(v) },
+    { key: 'budgetPerTradeUsd', label: 'Budget per buy', min: 1, max: 100000, step: 5, format: (v) => fmtUsd(v) },
     { key: 'maxHoldings', label: 'Max meme bags', min: 1, max: 30, step: 1 },
     { key: 'minScore', label: 'Min opportunity score', min: 0, max: 100, step: 5 },
     { key: 'targetPct', label: 'Take-profit', min: 2, max: 40, step: 1, unit: '%' },
@@ -296,7 +296,7 @@ export function PumpFunTradingPanel({ bot }: PumpFunTradingPanelProps) {
               onBlur={handleCapitalCommit}
               disabled={running}
               type="number"
-              min="100"
+              min="0.01"
               step="100"
               className="h-8 w-32 text-sm"
               placeholder="10000"
@@ -373,6 +373,23 @@ export function PumpFunTradingPanel({ bot }: PumpFunTradingPanelProps) {
                 </div>
               )
             })}
+            {/* Compound interest toggle */}
+            <div className="flex items-center justify-between gap-2 rounded-md border border-dashed border-border/60 p-2.5 sm:col-span-2">
+              <div className="space-y-0.5">
+                <Label className="text-xs">Compound interest</Label>
+                <p className="text-[10px] text-muted-foreground">
+                  Reinvest profits: per-trade budget scales with equity
+                  {bot.stats?.compound && bot.stats.compoundFactor > 0
+                    ? ` (×${bot.stats.compoundFactor.toFixed(2)})`
+                    : ''}
+                </p>
+              </div>
+              <Switch
+                checked={bot.config.compound}
+                onCheckedChange={(v) => bot.updateConfig({ compound: v })}
+                disabled={running}
+              />
+            </div>
           </div>
         </div>
 

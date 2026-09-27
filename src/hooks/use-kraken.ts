@@ -1,50 +1,40 @@
-// BINANCE trading hook — CLIENT-SIDE, triangular arbitrage.
+// KRAKEN paper-trading hook — CLIENT-SIDE, triangular arbitrage over the full
+// Kraken product shelf (crypto majors, stables, gold, cross pairs, EUR pairs
+// and fiat crosses).
 //
-// Two modes:
-//   • DEMO (default) — real market data from the Binance public API with
-//     FICTIONAL USD capital. No orders are ever sent.
-//   • REAL — the user provides Binance API keys in the panel; the hook then
-//     places real spot MARKET orders and the capital is the real USDT balance.
-//     Compound interest scales the per-trade budget with the real equity.
-//
-// One tick = one strategy cycle (same skeleton as seabot / curve):
-//   1. Refresh live quotes for every watched symbol (REAL Binance API, with
-//      the deterministic mock as fallback for sandbox).
+// One tick = one strategy cycle (same skeleton as seabot / curve / binance):
+//   1. Refresh live quotes for every watched pair (REAL Kraken Ticker API,
+//      with the deterministic mock as fallback for sandbox).
 //   2. For each open position, SELL when the spread widened to take-profit,
 //      dropped to stop-loss, or trailed from peak.
 //   3. For each triangle route, BUY when direct vs implied USD price differ by
 //      ≥ minSpreadBps: buy the token via the cheap leg, target the dear leg.
 //   4. Update stats + log everything.
+//
+// Capital is FICTIONAL (USD). No real orders are placed.
 
 'use client'
 
 import { useEffect, useRef, useState, useCallback } from 'react'
 import {
-  BINANCE_SYMBOLS,
-  BINANCE_TRIANGLES,
-  BINANCE_API_BASE,
-  mockSymbolUsdPrice,
-} from '@/lib/binance'
+  KRAKEN_ASSETS,
+  KRAKEN_TRIANGLES,
+  buildKrakenRows,
+  fetchKrakenTickers,
+  mockKrakenPrice,
+} from '@/lib/kraken'
 import type {
-  BinanceArbOpportunity,
-  BinancePriceRow,
-  BinanceTriangleRoute,
-} from '@/lib/binance'
-import {
-  binanceGetBalances,
-  binanceLotSize,
-  binanceMarketOrder,
-  binanceMinNotional,
-  loadCreds,
-  type ExchangeCredentials,
-} from '@/lib/cex'
+  KrakenPriceRow,
+  KrakenTickerQuote,
+  KrakenTriangleRoute,
+} from '@/lib/kraken'
 import type { EquityPoint } from '@/lib/trading-types'
 
 const PRICE_HISTORY_CAP = 60
 const TRADE_CAP = 200
 const LOG_CAP = 120
 
-export interface BinanceConfig {
+export interface KrakenConfig {
   capitalUsd: number
   budgetPerTradeUsd: number
   maxHoldings: number
@@ -54,11 +44,11 @@ export interface BinanceConfig {
   tickIntervalMs: number
   dataMode: 'live' | 'mock'
   compound: boolean // reinvest profits → per-trade budget scales with equity
-  /** Place real orders with real capital (requires Binance API keys). */
+  /** Place real orders with real capital (requires Kraken API keys). */
   liveTrading: boolean
 }
 
-export const DEFAULT_BINANCE_CONFIG: BinanceConfig = {
+export const DEFAULT_KRAKEN_CONFIG: KrakenConfig = {
   capitalUsd: 10000,
   budgetPerTradeUsd: 2000,
   maxHoldings: 6,
@@ -71,7 +61,7 @@ export const DEFAULT_BINANCE_CONFIG: BinanceConfig = {
   liveTrading: false,
 }
 
-export interface BinanceHolding {
+export interface KrakenHolding {
   id: string
   routeId: string
   routeName: string
@@ -88,7 +78,7 @@ export interface BinanceHolding {
   pnlUsd?: number
 }
 
-export interface BinanceTrade {
+export interface KrakenTrade {
   id: string
   type: 'buy' | 'sell'
   routeId: string
@@ -103,7 +93,7 @@ export interface BinanceTrade {
   createdAt: number
 }
 
-export interface BinanceStats {
+export interface KrakenStats {
   running: boolean
   startedAt: number | null
   uptimeMs: number
@@ -125,68 +115,80 @@ export interface BinanceStats {
   compoundFactor: number
 }
 
-export interface BinanceLogEntry {
+export interface KrakenLogEntry {
   time: number
   msg: string
   level: 'info' | 'warn' | 'error' | 'trade'
 }
 
-export interface BinanceState {
+export interface KrakenState {
   enabled: boolean
-  config: BinanceConfig
+  config: KrakenConfig
   cashUsd: number
-  rows: BinancePriceRow[]
-  holdings: BinanceHolding[]
-  trades: BinanceTrade[]
-  stats: BinanceStats | null
+  rows: KrakenPriceRow[]
+  holdings: KrakenHolding[]
+  trades: KrakenTrade[]
+  stats: KrakenStats | null
   equityCurve: EquityPoint[]
-  logs: BinanceLogEntry[]
+  logs: KrakenLogEntry[]
   status: 'idle' | 'scanning' | 'executing' | 'paused'
   priceHistory: Record<string, number[]>
-  opps: BinanceArbOpportunity[]
+  opps: (KrakenArbOpportunity)[]
   lastUpdatedAt: number | null
   dataSource: 'live' | 'mock'
 }
 
-/** Build price rows (live or mock). */
-function buildRows(
-  now: number,
-  mode: BinanceConfig['dataMode'],
-  live?: Record<string, number>
-): BinancePriceRow[] {
-  return BINANCE_SYMBOLS.map((s) => {
-    let priceUsd = s.anchorUsd
-    if (live) {
-      const p = live[s.symbol]
-      if (p && p > 0) priceUsd = p
-    } else if (mode === 'mock') {
-      priceUsd = mockSymbolUsdPrice(s.symbol, s.anchorUsd, now)
-    }
-    return { symbol: s.symbol, base: s.base, quote: s.quote, priceUsd, anchorUsd: s.anchorUsd }
-  })
+export interface KrakenArbOpportunity {
+  id: string
+  routeId: string
+  name: string
+  side: 'direct_cheap' | 'cross_cheap'
+  buyPrice: number
+  sellPrice: number
+  spreadBps: number
+  notionalUsd: number
+  profitUsd: number
+  detectedAt: number
+  executed: boolean
 }
 
-async function fetchBinancePrices(): Promise<Record<string, number>> {
-  const ctrl = new AbortController()
-  const t = setTimeout(() => ctrl.abort(), 12000)
-  try {
-    const res = await fetch(BINANCE_API_BASE, { signal: ctrl.signal })
-    if (!res.ok) throw new Error(`binance api ${res.status}`)
-    const arr = (await res.json()) as { symbol: string; price: string }[]
-    const out: Record<string, number> = {}
-    for (const x of arr) {
-      const p = parseFloat(x.price)
-      if (isFinite(p)) out[x.symbol] = p
+/** Build the raw quote map (symbol → own-quote price) for live or mock. */
+function buildRaw(
+  now: number,
+  mode: KrakenConfig['dataMode'],
+  live?: Record<string, KrakenTickerQuote>
+): Record<string, number> {
+  const raw: Record<string, number> = {}
+  for (const a of KRAKEN_ASSETS) {
+    if (mode === 'live' && live) {
+      const q = live[a.symbol]
+      raw[a.symbol] = q ? q.last : a.anchorPerQuote
+    } else if (mode === 'mock') {
+      raw[a.symbol] = mockKrakenPrice(a.symbol, a.anchorPerQuote, now)
+    } else {
+      raw[a.symbol] = a.anchorPerQuote
     }
-    return out
-  } finally {
-    clearTimeout(t)
+  }
+  return raw
+}
+
+async function fetchKrakenPrices(): Promise<Record<string, number> | null> {
+  try {
+    const live = await fetchKrakenTickers(KRAKEN_ASSETS.map((a) => a.symbol))
+    const raw: Record<string, number> = {}
+    for (const a of KRAKEN_ASSETS) {
+      const q = live[a.symbol]
+      raw[a.symbol] = q ? q.last : a.anchorPerQuote
+    }
+    return raw
+  } catch {
+    return null
   }
 }
 
-/** Direct vs implied divergence: positive means cross-implied > direct. */
+/** Direct vs implied divergence in USD. Positive ⇒ cross-implied > direct. */
 function routeSpread(
-  route: BinanceTriangleRoute,
+  route: KrakenTriangleRoute,
   priceBySym: Record<string, number>
 ): { directUsd: number; impliedUsd: number; spreadBps: number } | null {
   const direct = priceBySym[route.directSymbol]
@@ -198,22 +200,23 @@ function routeSpread(
   return { directUsd: direct, impliedUsd: implied, spreadBps }
 }
 
-export function useBinanceBot() {
-  const [state, setState] = useState<BinanceState>(() => {
+export function useKrakenBot() {
+  const [state, setState] = useState<KrakenState>(() => {
     const now = Date.now()
-    const rows = buildRows(now, 'mock')
+    const raw = buildRaw(now, 'mock')
+    const rows = buildKrakenRows(raw, null, now, 'mock')
     const priceHistory: Record<string, number[]> = {}
-    for (const r of rows) {
+    for (const a of KRAKEN_ASSETS) {
       const h: number[] = []
       for (let i = 20; i >= 0; i--) {
-        h.push(mockSymbolUsdPrice(r.symbol, r.anchorUsd, now - i * 10000))
+        h.push(mockKrakenPrice(a.symbol, a.anchorPerQuote, now - i * 10000))
       }
-      priceHistory[r.symbol] = h
+      priceHistory[a.symbol] = h
     }
     return {
       enabled: false,
-      config: { ...DEFAULT_BINANCE_CONFIG },
-      cashUsd: DEFAULT_BINANCE_CONFIG.capitalUsd,
+      config: { ...DEFAULT_KRAKEN_CONFIG },
+      cashUsd: DEFAULT_KRAKEN_CONFIG.capitalUsd,
       rows,
       holdings: [],
       trades: [],
@@ -233,12 +236,12 @@ export function useBinanceBot() {
   const loopRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const inFlightRef = useRef(false)
 
-  const log = useCallback((msg: string, level: BinanceLogEntry['level'] = 'info') => {
+  const log = useCallback((msg: string, level: KrakenLogEntry['level'] = 'info') => {
     setState((s) => ({
       ...s,
       logs: [{ time: Date.now(), msg, level }, ...s.logs].slice(0, LOG_CAP),
     }))
-    console[level === 'trade' ? 'log' : level](`[binance] ${msg}`)
+    console[level === 'trade' ? 'log' : level](`[kraken] ${msg}`)
   }, [])
 
   const scan = useCallback(async () => {
@@ -254,31 +257,30 @@ export function useBinanceBot() {
       const now = Date.now()
       const cfg = s0.config
 
-      // 1. Refresh quotes — live Binance API or mock engine
-      let rows: BinancePriceRow[]
+      // 1. Refresh quotes — live Kraken API or mock engine
+      let raw: Record<string, number>
       let liveData = false
       let liveErr: unknown = null
       if (cfg.dataMode === 'live') {
-        try {
-          const live = await fetchBinancePrices()
-          rows = buildRows(now, 'live', live)
+        const liveRaw = await fetchKrakenPrices()
+        if (liveRaw) {
+          raw = liveRaw
           liveData = true
-        } catch (e) {
-          liveErr = e
-          rows = buildRows(now, 'mock')
+        } else {
+          liveErr = new Error('kraken api unreachable')
+          raw = buildRaw(now, 'mock')
         }
       } else {
-        rows = buildRows(now, 'mock')
+        raw = buildRaw(now, 'mock')
       }
 
-      const priceBySym: Record<string, number> = {}
-      for (const r of rows) priceBySym[r.symbol] = r.priceUsd
-
+      const rows = buildKrakenRows(raw, null, now, liveData ? 'live' : 'mock')
       const priceHistory: Record<string, number[]> = {}
-      for (const r of rows) {
-        const arr = [...(s0.priceHistory[r.symbol] ?? []), r.priceUsd]
+      for (const a of KRAKEN_ASSETS) {
+        const sym = a.symbol
+        const arr = [...(s0.priceHistory[sym] ?? []), raw[sym] ?? a.anchorPerQuote]
         if (arr.length > PRICE_HISTORY_CAP) arr.splice(0, arr.length - PRICE_HISTORY_CAP)
-        priceHistory[r.symbol] = arr
+        priceHistory[sym] = arr
       }
       setState((s) => ({
         ...s,
@@ -289,20 +291,20 @@ export function useBinanceBot() {
       }))
 
       if (liveErr) {
-        log(`Binance API no disponible — usando motor demo determinista`, 'warn')
+        log(`Kraken API no disponible — usando motor demo determinista`, 'warn')
       }
 
       // 2. SELL logic — scan open holdings (spread converged? stop? trail?)
       let cash = stateRef.current.cashUsd
       const holdings = stateRef.current.holdings.map((h) => ({ ...h }))
       const trades = [...stateRef.current.trades]
-      const opps: BinanceArbOpportunity[] = []
+      const opps: KrakenArbOpportunity[] = []
 
       for (const h of holdings) {
         if (h.status !== 'open') continue
-        const route = BINANCE_TRIANGLES.find((r) => r.id === h.routeId)
+        const route = KRAKEN_TRIANGLES.find((r) => r.id === h.routeId)
         if (!route) continue
-        const s = routeSpread(route, priceBySym)
+        const s = routeSpread(route, raw)
         if (!s) continue
         // current normalized USD per token depends on which leg was bought
         const cur = h.side === 'cross_cheap' ? s.directUsd : s.impliedUsd
@@ -331,7 +333,7 @@ export function useBinanceBot() {
           h.pnlUsd = pnl
           cash += h.notionalUsd + pnl
           trades.unshift({
-            id: `bnt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            id: `krt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
             type: 'sell',
             routeId: h.routeId,
             routeName: h.routeName,
@@ -345,7 +347,7 @@ export function useBinanceBot() {
             createdAt: now,
           })
           opps.unshift({
-            id: `bnp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            id: `krp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
             routeId: h.routeId,
             name: h.routeName,
             side: h.side,
@@ -363,7 +365,7 @@ export function useBinanceBot() {
           )
           if (cfg.compound) {
             log(
-              `⚡ Interés compuesto: capital disponible → ${fmtUsdLocal(cash, 2)} USD (P&L ${pnl >= 0 ? '+' : ''}${fmtUsdLocal(pnl, 2)})`,
+              `⚡ Interés compuesto: capital disponible → ${fmtUsdKraken(cash, 2)} USD (P&L ${pnl >= 0 ? '+' : ''}${fmtUsdKraken(pnl, 2)})`,
               'info'
             )
           }
@@ -380,9 +382,9 @@ export function useBinanceBot() {
       const compoundFactor = cfg.compound ? Math.max(equityBefore, 1) / Math.max(cfg.capitalUsd, 1) : 1
       const openCount = openBefore.length
       let buys = 0
-      for (const route of BINANCE_TRIANGLES) {
+      for (const route of KRAKEN_TRIANGLES) {
         if (openCount + buys >= cfg.maxHoldings) break
-        const s = routeSpread(route, priceBySym)
+        const s = routeSpread(route, raw)
         if (!s) continue
         const spread = Math.abs(s.spreadBps)
         if (spread < cfg.minSpreadBps) continue
@@ -401,7 +403,7 @@ export function useBinanceBot() {
         const profitUsd = ((sellPrice - buyPrice) / buyPrice) * notional
 
         holdings.unshift({
-          id: `bnh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          id: `krh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           routeId: route.id,
           routeName: route.name,
           token: route.token,
@@ -414,7 +416,7 @@ export function useBinanceBot() {
           boughtAt: now,
         })
         trades.unshift({
-          id: `bnt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          id: `krt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           type: 'buy',
           routeId: route.id,
           routeName: route.name,
@@ -428,7 +430,7 @@ export function useBinanceBot() {
           createdAt: now,
         })
         opps.unshift({
-          id: `bnp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          id: `krp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           routeId: route.id,
           name: route.name,
           side: crossCheap ? 'cross_cheap' : 'direct_cheap',
@@ -457,7 +459,7 @@ export function useBinanceBot() {
       const wins = sold.filter((h) => (h.pnlUsd ?? 0) >= 0).length
       const total = sold.length
       const prevStats = stateRef.current.stats
-      const stats: BinanceStats = {
+      const stats: KrakenStats = {
         running: s0.enabled,
         startedAt: s0.enabled ? (prevStats?.startedAt ?? now) : null,
         uptimeMs: s0.enabled ? now - (prevStats?.startedAt ?? now) : 0,
@@ -478,7 +480,10 @@ export function useBinanceBot() {
         compound: cfg.compound,
         compoundFactor,
       }
-      const unrealized = open.reduce((a, h) => a + (h.currentPrice - h.buyPrice) * (h.notionalUsd / h.buyPrice), 0)
+      const unrealized = open.reduce(
+        (a, h) => a + (h.currentPrice - h.buyPrice) * (h.notionalUsd / h.buyPrice),
+        0
+      )
       const eqPoint: EquityPoint = {
         timestamp: now,
         equity,
@@ -500,7 +505,7 @@ export function useBinanceBot() {
 
       if (buys === 0) {
         log(
-          `Sin divergencias ≥ ${cfg.minSpreadBps}bps este ciclo — ${BINANCE_TRIANGLES.length} rutas rastreadas`,
+          `Sin divergencias ≥ ${cfg.minSpreadBps}bps este ciclo — ${KRAKEN_TRIANGLES.length} rutas rastreadas`,
           'info'
         )
       }
@@ -517,7 +522,7 @@ export function useBinanceBot() {
       stats: s.stats ? { ...s.stats, running: true } : s.stats,
     }))
     log(
-      `BINANCE BOT iniciado — ${stateRef.current.config.capitalUsd.toFixed(2)} USD ficticios, triangle arb`,
+      `KRAKEN BOT iniciado — ${stateRef.current.config.capitalUsd.toFixed(2)} USD ficticios, triangle arb`,
       'trade'
     )
     if (loopRef.current) clearInterval(loopRef.current)
@@ -532,7 +537,7 @@ export function useBinanceBot() {
       clearInterval(loopRef.current)
       loopRef.current = null
     }
-    log('Binance bot detenido', 'info')
+    log('Kraken bot detenido', 'info')
   }, [log])
 
   const resetAccount = useCallback(() => {
@@ -556,7 +561,7 @@ export function useBinanceBot() {
     log(`Cuenta reiniciada a ${cfg.capitalUsd.toFixed(2)} USD`, 'info')
   }, [log])
 
-  const updateConfig = useCallback((patch: Partial<BinanceConfig>) => {
+  const updateConfig = useCallback((patch: Partial<KrakenConfig>) => {
     setState((s) => {
       const next = { ...s.config, ...patch }
       if (patch.capitalUsd !== undefined && !s.enabled) {
@@ -589,7 +594,7 @@ function fmtBpsLocal(n: number): string {
   return `${(n / 100).toFixed(2)}%`
 }
 
-function fmtUsdLocal(n: number, d = 2): string {
+function fmtUsdKraken(n: number, d = 2): string {
   return n.toLocaleString('en-US', {
     minimumFractionDigits: d,
     maximumFractionDigits: d,

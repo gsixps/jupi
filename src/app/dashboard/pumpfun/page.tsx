@@ -3,7 +3,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { BotTabs } from '@/components/trading/BotTabs'
-import { usePumpFunBot } from '@/hooks/use-pumpfun'
+import { usePumpFunBotContext } from '@/components/trading/BotsProvider'
 import { PumpFunHeader } from '@/components/pumpfun/PumpFunHeader'
 import { PumpFunTradingPanel } from '@/components/pumpfun/PumpFunTradingPanel'
 import { PumpFunMarketGrid } from '@/components/pumpfun/PumpFunMarketGrid'
@@ -15,7 +15,7 @@ const queryClient = new QueryClient({
 })
 
 function PumpFunInner() {
-  const bot = usePumpFunBot()
+  const bot = usePumpFunBotContext()
 
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">

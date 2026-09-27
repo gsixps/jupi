@@ -3,7 +3,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { BotTabs } from '@/components/trading/BotTabs'
-import { useCurveBot } from '@/hooks/use-curve'
+import { useCurveBotContext } from '@/components/trading/BotsProvider'
 import { CurveHeader } from '@/components/curve/CurveHeader'
 import { CurveTradingPanel } from '@/components/curve/CurveTradingPanel'
 import { CurveMarketGrid } from '@/components/curve/CurveMarketGrid'
@@ -15,7 +15,7 @@ const queryClient = new QueryClient({
 })
 
 function CurveInner() {
-  const curve = useCurveBot()
+  const curve = useCurveBotContext()
 
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">

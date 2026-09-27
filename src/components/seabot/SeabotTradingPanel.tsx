@@ -41,6 +41,7 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
+import { Switch } from '@/components/ui/switch'
 import type { useSeabot } from '@/hooks/use-seabot'
 import { fmtEth, fmtEthUsd, fmtNum, fmtTime, fmtPct, fmtDuration } from '@/lib/format'
 import { ETH_USD_PRICE } from '@/lib/seabot'
@@ -66,7 +67,7 @@ interface NumericControl {
 }
 
 const CONTROLS: NumericControl[] = [
-  { key: 'budgetPerTradeEth', label: 'Budget per buy', min: 0.001, max: 1, step: 0.005, format: (v) => `${v.toFixed(3)} ETH ≈ ${fmtEthUsd(v, ETH_USD_PRICE)}` },
+  { key: 'budgetPerTradeEth', label: 'Budget per buy', min: 0.0001, max: 50, step: 0.0005, format: (v) => `${v.toFixed(3)} ETH ≈ ${fmtEthUsd(v, ETH_USD_PRICE)}` },
   { key: 'maxHoldings', label: 'Max holdings', min: 1, max: 30, step: 1 },
   { key: 'globalTargetPct', label: 'Take-profit', min: 1, max: 25, step: 1, unit: '%' },
   { key: 'globalStopLossPct', label: 'Stop-loss', min: 1, max: 25, step: 1, unit: '%' },
@@ -327,8 +328,8 @@ export function SeabotTradingPanel({ seabot }: SeabotTradingPanelProps) {
                 onBlur={handleCapitalCommit}
                 disabled={running}
                 type="number"
-                min="0.001"
-                step="0.1"
+                min="0.0001"
+                step="0.0001"
                 className="h-8 w-32 text-sm"
                 placeholder="10"
               />
@@ -435,6 +436,23 @@ export function SeabotTradingPanel({ seabot }: SeabotTradingPanelProps) {
                 </div>
               )
             })}
+            {/* Compound interest toggle */}
+            <div className="flex items-center justify-between gap-2 rounded-md border border-dashed border-border/60 p-2.5 sm:col-span-2">
+              <div className="space-y-0.5">
+                <Label className="text-xs">Compound interest</Label>
+                <p className="text-[10px] text-muted-foreground">
+                  Reinvest profits: per-trade budget scales with equity
+                  {seabot.stats?.compound && seabot.stats.compoundFactor > 0
+                    ? ` (×${seabot.stats.compoundFactor.toFixed(2)})`
+                    : ''}
+                </p>
+              </div>
+              <Switch
+                checked={seabot.config.compound}
+                onCheckedChange={(v) => seabot.updateConfig({ compound: v })}
+                disabled={running}
+              />
+            </div>
           </div>
         </div>
 

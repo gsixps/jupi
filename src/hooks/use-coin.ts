@@ -76,6 +76,8 @@ export interface CoinStats {
   lastScanAt: number
   liveData: boolean
   bestStoredUsd: number // market value of the stored coins
+  compound: boolean
+  compoundFactor: number
 }
 
 export interface CoinLogEntry {
@@ -95,6 +97,9 @@ export interface CoinState {
   trailingPct: number
   tickIntervalMs: number
   cashUsd: number
+  compound: boolean
+  /** Place real orders on Binance with real capital (requires API keys). */
+  liveTrading: boolean
   rows: CoinPriceRow[]
   holdings: CoinHolding[]
   trades: CoinTrade[]
@@ -169,6 +174,8 @@ export function useCoinBot(assetKey: 'btc' | 'eth') {
       trailingPct: asset.trailingPct,
       tickIntervalMs: asset.tickIntervalMs,
       cashUsd: asset.capitalUsd,
+      compound: true,
+      liveTrading: false,
       rows,
       holdings: [],
       trades: [],
@@ -296,10 +303,16 @@ export function useCoinBot(assetKey: 'btc' | 'eth') {
             status: 'filled',
             createdAt: now,
           })
-          log(
-            `CERRADO ${h.qty.toFixed(5)} ${symbol} @ ${sellPrice.toFixed(2)} USD (${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} USD)`,
+log(
+            `VENDIDO ${h.qty.toFixed(6)} ${symbol} @ ${sellPrice.toFixed(2)} USD en ${dearest.symbol} (${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} USD)`,
             'trade'
           )
+          if (s0.compound) {
+            log(
+              `⚡ Interés compuesto: capital disponible → ${fmtUsdCoin(cash, 2)} USD (P&L ${pnl >= 0 ? '+' : ''}${fmtUsdCoin(pnl, 2)})`,
+              'info'
+            )
+          }
         } else {
           h.peakPriceUsd = Math.max(h.peakPriceUsd, dearest.priceUsd)
         }
@@ -307,11 +320,17 @@ export function useCoinBot(assetKey: 'btc' | 'eth') {
 
       // 4. BUY cheap — accumulate the coin
       const openCount = holdings.filter((h) => h.status === 'open').length
+      const investedBeforeCoin = holdings
+        .filter((h) => h.status === 'open')
+        .reduce((a, h) => a + h.buyPriceUsd * h.qty, 0)
+      const equityBeforeCoin = cash + investedBeforeCoin
+      // Compound interest: scale per-trade budget with grown capital
+      const compoundFactor = s0.compound ? Math.max(equityBeforeCoin, 1) / Math.max(s0.capitalUsd, 1) : 1
       let buys = 0
       if (spreadBps >= s0.minSpreadBps && openCount < s0.maxHoldings) {
         const maxBuyRef = dearest.priceUsd // buy as close to the cheapest as allowed
-        const afford = Math.min(s0.budgetPerTradeUsd, cash)
-        if (afford >= 100 && cheapest.priceUsd <= maxBuyRef) {
+        const afford = Math.min(s0.budgetPerTradeUsd * compoundFactor, cash)
+        if (afford >= 0.01 && cheapest.priceUsd <= maxBuyRef) {
           const qty = afford / cheapest.priceUsd
           holdings.unshift({
             id: `coh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -384,6 +403,8 @@ export function useCoinBot(assetKey: 'btc' | 'eth') {
         lastScanAt: now,
         liveData: stateRef.current.dataSource === 'live',
         bestStoredUsd: storedUsd,
+        compound: s0.compound,
+        compoundFactor,
       }
       const unrealized = storedUsd - invested
       const eqPoint: EquityPoint = {
@@ -476,6 +497,7 @@ export function useCoinBot(assetKey: 'btc' | 'eth') {
         'stopLossPct',
         'trailingPct',
         'tickIntervalMs',
+        'compound',
       ]
       const next: Partial<CoinState> = {}
       for (const k of allowed) {
@@ -504,6 +526,13 @@ export function useCoinBot(assetKey: 'btc' | 'eth') {
     resetAccount,
     log,
   }
+}
+
+function fmtUsdCoin(n: number, d = 2): string {
+  return n.toLocaleString('en-US', {
+    minimumFractionDigits: d,
+    maximumFractionDigits: d,
+  })
 }
 
 export type CoinBot = ReturnType<typeof useCoinBot>

@@ -3,7 +3,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { BotTabs } from '@/components/trading/BotTabs'
-import { useBinanceBot } from '@/hooks/use-binance'
+import { useBinanceBotContext } from '@/components/trading/BotsProvider'
 import { BinanceHeader } from '@/components/binance/BinanceHeader'
 import { BinanceTradingPanel } from '@/components/binance/BinanceTradingPanel'
 import { BinanceMarketGrid } from '@/components/binance/BinanceMarketGrid'
@@ -15,7 +15,7 @@ const queryClient = new QueryClient({
 })
 
 function BinanceInner() {
-  const binance = useBinanceBot()
+  const binance = useBinanceBotContext()
 
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">

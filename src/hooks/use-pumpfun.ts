@@ -44,6 +44,9 @@ export interface PumpFunConfig {
   trailingPct: number
   tickIntervalMs: number
   dataMode: 'live' | 'mock' // 'live'=real pump.fun API, 'mock'=deterministic demo
+  compound: boolean // reinvest profits → per-trade budget scales with equity
+  /** Trade on Solana with a connected Phantom wallet and real capital. */
+  liveTrading: boolean
 }
 
 export const DEFAULT_PUMPFUN_CONFIG: PumpFunConfig = {
@@ -56,6 +59,8 @@ export const DEFAULT_PUMPFUN_CONFIG: PumpFunConfig = {
   trailingPct: 3,
   tickIntervalMs: 10000,
   dataMode: 'live',
+  compound: true,
+  liveTrading: false,
 }
 
 export interface PumpHolding {
@@ -112,6 +117,8 @@ export interface PumpFunStats {
   lastScanAt: number
   liveData: boolean
   bestMcapUsd: number // market cap of the top-score opportunity this scan
+  compound: boolean
+  compoundFactor: number
 }
 
 export interface PumpFunLogEntry {
@@ -449,6 +456,12 @@ export function usePumpFunBot() {
             `VENDIDO ${h.symbol} ${sellPrice.toFixed(6)} USD (${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} USD, ${pnlBps >= 0 ? '+' : ''}${pnlBps}bps) — ${reason}`,
             'trade'
           )
+          if (cfg.compound) {
+            log(
+              `⚡ Interés compuesto: capital disponible → ${fmtUsdPump(cash, 2)} USD (P&L ${pnl >= 0 ? '+' : ''}${fmtUsdPump(pnl, 2)})`,
+              'info'
+            )
+          }
         } else {
           h.peakPriceUsd = Math.max(h.peakPriceUsd, current)
         }
@@ -456,6 +469,12 @@ export function usePumpFunBot() {
 
       // 4. BUY cheap coins — scored opportunities
       const openCount = holdings.filter((h) => h.status === 'open').length
+      const investedBeforePump = holdings
+        .filter((h) => h.status === 'open')
+        .reduce((a, h) => a + h.buyPriceUsd * h.qty, 0)
+      const equityBeforePump = cash + investedBeforePump
+      // Compound interest: scale per-trade budget with grown capital
+      const compoundFactor = cfg.compound ? Math.max(equityBeforePump, 1) / Math.max(cfg.capitalUsd, 1) : 1
       let buys = 0
       const openSymbols = new Set(
         holdings.filter((h) => h.status === 'open').map((h) => h.symbol)
@@ -466,8 +485,8 @@ export function usePumpFunBot() {
         if (c.verdict === 'sell') continue
         if (openSymbols.has(c.symbol)) continue
         if (c.refUsd > 0 && c.priceUsd > c.refUsd * 1.02) continue // not a cheap entry
-        const spend = Math.min(cfg.budgetPerTradeUsd, cash)
-        if (spend < 25) break
+        const spend = Math.min(cfg.budgetPerTradeUsd * compoundFactor, cash)
+        if (spend < 0.01) break
         const qty = spend / c.priceUsd
         holdings.unshift({
           id: `pph_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -540,6 +559,8 @@ export function usePumpFunBot() {
         lastScanAt: now,
         liveData: stateRef.current.dataSource === 'live',
         bestMcapUsd: byScore[0]?.mcapUsd ?? 0,
+        compound: cfg.compound,
+        compoundFactor,
       }
       const unrealized = openValue - investedUsd
       const eqPoint: EquityPoint = {
@@ -658,6 +679,13 @@ function fmtMcap(n: number): string {
   if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000) return `$${(n / 1_000).toFixed(1)}K`
   return `$${n.toFixed(0)}`
+}
+
+function fmtUsdPump(n: number, d = 2): string {
+  return n.toLocaleString('en-US', {
+    minimumFractionDigits: d,
+    maximumFractionDigits: d,
+  })
 }
 
 export type PumpFunBot = ReturnType<typeof usePumpFunBot>

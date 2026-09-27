@@ -4,9 +4,11 @@ import { useState } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { useWallet } from '@/hooks/use-wallet'
-import { useLiveTrading } from '@/hooks/use-live-trading'
-import { usePaperTrading } from '@/hooks/use-paper-trading'
+import {
+  useLiveBotContext,
+  usePaperBotContext,
+  useWalletContext,
+} from '@/components/trading/BotsProvider'
 import { ModeToggle, type TradingMode } from '@/components/trading/ModeToggle'
 import { BotTabs } from '@/components/trading/BotTabs'
 import { WalletConnect } from '@/components/trading/WalletConnect'
@@ -77,14 +79,11 @@ function PaperLogPanel({
 function DashboardInner() {
   const [mode, setMode] = useState<TradingMode>('paper')
 
-  // All three hooks must always be called (rules of hooks) regardless of mode.
-  //  - wallet: Phantom wallet (used only in Live mode)
-  //  - live:   real on-chain bot (used only in Live mode)
-  //  - paper:  client-side paper bot (used only in Paper mode) — REAL Jupiter
-  //            data, fictional capital. NO socket dependency.
-  const wallet = useWallet()
-  const live = useLiveTrading(wallet)
-  const paper = usePaperTrading()
+  // All three bots come from the root-level provider, so the Jupiter bot
+  // keeps running while the user visits any other bot dashboard.
+  const wallet = useWalletContext()
+  const live = useLiveBotContext()
+  const paper = usePaperBotContext()
 
   // ============ LIVE MODE ============
   if (mode === 'live') {
