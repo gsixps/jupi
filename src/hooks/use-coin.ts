@@ -23,6 +23,13 @@ import type {
   CoinPriceRow,
 } from '@/lib/coin'
 import type { EquityPoint } from '@/lib/trading-types'
+import {
+  binanceGetBalances,
+  binanceMarketOrder,
+  binanceMinNotional,
+  loadCreds,
+  type ExchangeCredentials,
+} from '@/lib/cex'
 
 const PRICE_HISTORY_CAP = 60
 const TRADE_CAP = 200
@@ -41,6 +48,13 @@ export interface CoinHolding {
   sellPriceUsd?: number
   sellPair?: string
   pnlUsd?: number
+  /** LIVE only: base quantity actually filled on Binance. */
+  realQty?: number
+  /** LIVE only: quote amount actually paid (BUY) or received (SELL). */
+  realQuoteUsd?: number
+  /** LIVE only: real Binance order ids, for reconciliation. */
+  realOrderId?: string
+  realExitOrderId?: string
 }
 
 export interface CoinTrade {
@@ -111,6 +125,13 @@ export interface CoinState {
   signals: CoinArbSignal[]
   lastUpdatedAt: number | null
   dataSource: 'live' | 'mock'
+  /**
+   * LIVE safety latch. A rejected real order (no funds, below the symbol
+   * minimum, API error) stops the bot and records why. It never falls back to
+   * the simulated engine while real money is at stake.
+   */
+  halted: boolean
+  haltReason: string | null
 }
 
 function buildRows(
@@ -187,6 +208,8 @@ export function useCoinBot(assetKey: 'btc' | 'eth') {
       signals: [],
       lastUpdatedAt: null,
       dataSource: 'mock',
+      halted: false,
+      haltReason: null,
     }
   })
 
@@ -202,6 +225,29 @@ export function useCoinBot(assetKey: 'btc' | 'eth') {
     }))
     console[level === 'trade' ? 'log' : level](`[${symbol}] ${msg}`)
   }, [symbol])
+
+  /**
+   * Stop the bot and surface why. Triggered whenever a REAL order path fails:
+   * with real money we halt and warn rather than keep simulating.
+   */
+  const halt = useCallback(
+    (reason: string) => {
+      if (loopRef.current) {
+        clearInterval(loopRef.current)
+        loopRef.current = null
+      }
+      setState((s) => ({
+        ...s,
+        enabled: false,
+        halted: true,
+        haltReason: reason,
+        status: 'paused',
+        stats: s.stats ? { ...s.stats, running: false } : s.stats,
+      }))
+      log(`⛔ BOT DETENIDO (live): ${reason}`, 'error')
+    },
+    [log]
+  )
 
   const scan = useCallback(async () => {
     if (inFlightRef.current) return
@@ -261,6 +307,29 @@ export function useCoinBot(assetKey: 'btc' | 'eth') {
       const trades = [...stateRef.current.trades]
       const signals: CoinArbSignal[] = []
 
+      // LIVE: mirror the real USDT balance so `cash` matches the exchange.
+      let cred: ExchangeCredentials | null = null
+      let realTrades = 0
+      if (s0.liveTrading) {
+        cred = loadCreds('binance')
+        if (!cred || !cred.apiKey || !cred.apiSecret) {
+          halt('faltan credenciales de Binance (API key + secret)')
+          return
+        }
+        try {
+          const bals = await binanceGetBalances(cred)
+          const usdt = bals.find((b) => b.symbol === 'USDT')
+          if (!usdt) {
+            halt('la cuenta de Binance no tiene saldo en USDT')
+            return
+          }
+          cash = usdt.free
+        } catch (e) {
+          halt(`no se pudo leer el saldo real: ${(e as Error).message}`)
+          return
+        }
+      }
+
       for (const h of holdings) {
         if (h.status !== 'open') continue
         h.currentPriceUsd = dearest.priceUsd
@@ -280,6 +349,68 @@ export function useCoinBot(assetKey: 'btc' | 'eth') {
         }
 
         if (reason) {
+          // LIVE: sell the base quantity actually filled, on the dearest pair
+          // (the exit leg of the real cross-pair arb).
+          if (s0.liveTrading && cred) {
+            const qty = h.realQty ?? 0
+            if (!(qty > 0)) {
+              halt(`posición ${symbol} sin cantidad real registrada; no se puede cerrar`)
+              return
+            }
+            let order
+            try {
+              order = await binanceMarketOrder({
+                cred,
+                symbol: dearest.symbol,
+                side: 'SELL',
+                sellBaseQty: qty,
+              })
+            } catch (e) {
+              halt(`orden SELL ${dearest.symbol} rechazada: ${(e as Error).message}`)
+              return
+            }
+            if (order.executedQty <= 0) {
+              halt(`orden SELL ${dearest.symbol} sin fills (${order.orderId})`)
+              return
+            }
+            const proceeds = order.executedQuote
+            const sellPrice = order.price
+            const pnl = proceeds - (h.realQuoteUsd ?? h.buyPriceUsd * h.qty)
+            const pnlBps = Math.round((pnl / Math.max(h.realQuoteUsd ?? 1, 1e-9)) * 10000)
+            h.status = 'sold'
+            h.soldAt = now
+            h.sellPriceUsd = sellPrice
+            h.sellPair = dearest.symbol
+            h.pnlUsd = pnl
+            h.realExitOrderId = order.orderId
+            h.realQuoteUsd = proceeds
+            cash += proceeds
+            realTrades++
+            trades.unshift({
+              id: `cot_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+              type: 'sell',
+              symbol,
+              qty: order.executedQty,
+              priceUsd: sellPrice,
+              pair: dearest.symbol,
+              notionalUsd: proceeds,
+              pnlUsd: pnl,
+              profitBps: pnlBps,
+              reason: `${reason} (real)`,
+              status: 'filled',
+              createdAt: now,
+            })
+            log(
+              `LIVE SELL ${order.executedQty} ${symbol} @ ${sellPrice.toFixed(2)} USD en ${dearest.symbol} → ${fmtUsdCoin(proceeds, 2)} USD (${pnl >= 0 ? '+' : ''}${fmtUsdCoin(pnl, 2)})`,
+              'trade'
+            )
+            log(
+              `⚡ Interés compuesto: capital disponible → ${fmtUsdCoin(cash, 2)} USD (P&L real ${pnl >= 0 ? '+' : ''}${fmtUsdCoin(pnl, 2)})`,
+              'info'
+            )
+            continue
+          }
+
           const sellPrice = dearest.priceUsd
           const pnl = (sellPrice - h.buyPriceUsd) * h.qty
           const pnlBps = Math.round(((sellPrice - h.buyPriceUsd) / h.buyPriceUsd) * 10000)
@@ -331,6 +462,79 @@ log(
         const maxBuyRef = dearest.priceUsd // buy as close to the cheapest as allowed
         const afford = Math.min(s0.budgetPerTradeUsd * compoundFactor, cash)
         if (afford >= 0.01 && cheapest.priceUsd <= maxBuyRef) {
+          // LIVE: buy on the cheapest real pair first; the simulated lot below
+          // is only created from the actual fill.
+          if (s0.liveTrading && cred) {
+            const pair = cheapest.symbol
+            const minNotional = await binanceMinNotional(pair).catch(() => 0)
+            if (minNotional > 0 && afford < minNotional) {
+              log(
+                `⏭ ${symbol}: ${fmtUsdCoin(afford, 2)} USD < mínimo de Binance (${fmtUsdCoin(minNotional, 2)}) en ${pair} — se omite esta señal`,
+                'warn'
+              )
+            } else {
+              let order
+              try {
+                order = await binanceMarketOrder({
+                  cred,
+                  symbol: pair,
+                  side: 'BUY',
+                  buyQuoteUsd: afford,
+                })
+              } catch (e) {
+                halt(`orden BUY ${pair} rechazada: ${(e as Error).message}`)
+                return
+              }
+              if (order.executedQty <= 0) {
+                halt(`orden BUY ${pair} sin fills (${order.orderId})`)
+                return
+              }
+              const spent = order.executedQuote
+              holdings.unshift({
+                id: `coh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                qty: order.executedQty,
+                buyPriceUsd: order.price,
+                buyPair: pair,
+                currentPriceUsd: order.price,
+                peakPriceUsd: order.price,
+                status: 'open',
+                boughtAt: now,
+                realQty: order.executedQty,
+                realQuoteUsd: spent,
+                realOrderId: order.orderId,
+              })
+              trades.unshift({
+                id: `cot_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                type: 'buy',
+                symbol,
+                qty: order.executedQty,
+                priceUsd: order.price,
+                pair,
+                notionalUsd: spent,
+                pnlUsd: 0,
+                profitBps: spreadBps,
+                reason: `Comprando barato en ${pair} @ ${order.price.toFixed(2)} (spread ${spreadBps}bps) [real]`,
+                status: 'filled',
+                createdAt: now,
+              })
+              signals.unshift({
+                id: `cos_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                cheapestSymbol: cheapest.symbol,
+                dearestSymbol: dearest.symbol,
+                cheapestUsd: cheapest.priceUsd,
+                dearestUsd: dearest.priceUsd,
+                spreadBps,
+                detectedAt: now,
+              })
+              cash -= spent
+              buys++
+              realTrades++
+              log(
+                `LIVE BUY ${order.executedQty} ${symbol} en ${pair} @ ${order.price.toFixed(2)} USD — ${fmtUsdCoin(spent, 2)} USD (spread ${spreadBps}bps)`,
+                'trade'
+              )
+            }
+          } else {
           const qty = afford / cheapest.priceUsd
           holdings.unshift({
             id: `coh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -371,6 +575,20 @@ log(
             `ALMACENANDO ${qty.toFixed(5)} ${symbol} desde ${cheapest.symbol} @ ${cheapest.priceUsd.toFixed(2)} USD (spread ${spreadBps}bps contra ${dearest.symbol})`,
             'trade'
           )
+          }
+        }
+      }
+
+      // 4b. LIVE: re-read the real balance after trading so the displayed
+      // cash/equity is the exchange truth, not an approximation of the fills.
+      if (s0.liveTrading && cred && realTrades > 0) {
+        try {
+          const bals = await binanceGetBalances(cred)
+          const usdt = bals.find((b) => b.symbol === 'USDT')
+          if (usdt) cash = usdt.free
+        } catch (e) {
+          halt(`no se pudo reconciliar el saldo tras operar: ${(e as Error).message}`)
+          return
         }
       }
 
@@ -438,21 +656,36 @@ log(
   }, [log, symbol, asset])
 
   const start = useCallback(() => {
+    const s0 = stateRef.current
+    if (s0.liveTrading) {
+      const c = loadCreds('binance')
+      if (!c || !c.apiKey || !c.apiSecret) {
+        halt('modo live sin credenciales de Binance — configura la API key y el secret')
+        return
+      }
+    }
     setState((s) => ({
       ...s,
       enabled: true,
+      halted: false,
+      haltReason: null,
       status: 'scanning',
       stats: s.stats ? { ...s.stats, running: true } : s.stats,
     }))
     log(
-      `BOT ${symbol.toUpperCase()} iniciado — ${stateRef.current.capitalUsd.toFixed(2)} USD ficticios, cross-pair accumulation`,
+      s0.liveTrading
+        ? `BOT ${symbol.toUpperCase()} iniciado en MODO LIVE — cross-pair accumulation con órdenes reales en ${s0.capitalUsd.toFixed(2)} USD`
+        : `BOT ${symbol.toUpperCase()} iniciado — ${s0.capitalUsd.toFixed(2)} USD ficticios, cross-pair accumulation`,
       'trade'
     )
     if (loopRef.current) clearInterval(loopRef.current)
     loopRef.current = setInterval(() => {
-      scan().catch((e) => log(`Scan error: ${e.message}`, 'error'))
-    }, stateRef.current.tickIntervalMs)
-  }, [scan, log, symbol])
+      scan().catch((e) => {
+        if (stateRef.current.liveTrading) halt(`error inesperado: ${e.message}`)
+        else log(`Scan error: ${e.message}`, 'error')
+      })
+    }, s0.tickIntervalMs)
+  }, [scan, log, symbol, halt])
 
   const stop = useCallback(() => {
     setState((s) => ({ ...s, enabled: false, status: 'idle' }))
@@ -468,6 +701,8 @@ log(
     setState((s) => ({
       ...s,
       enabled: false,
+      halted: false,
+      haltReason: null,
       status: 'idle',
       cashUsd: s0.capitalUsd,
       holdings: [],
@@ -526,6 +761,7 @@ log(
     updateConfig,
     resetAccount,
     log,
+    halt,
   }
 }
 

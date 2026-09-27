@@ -42,6 +42,8 @@ import {
 import { Switch } from '@/components/ui/switch'
 import type { CoinBot } from '@/hooks/use-coin'
 import { fmtUsd, fmtTime, fmtPct, fmtDuration, fmtBps } from '@/lib/format'
+import { ExchangeKeysPanel } from '@/components/cex/ExchangeKeysPanel'
+import { verifyBinanceKeys } from '@/lib/cex'
 
 interface CoinTradingPanelProps {
   bot: CoinBot
@@ -413,6 +415,29 @@ export function CoinTradingPanel({ bot }: CoinTradingPanelProps) {
         </div>
 
         <Separator />
+
+        {/* Real-mode connection */}
+        <ExchangeKeysPanel
+          kind="binance"
+          verify={verifyBinanceKeys}
+          liveEnabled={bot.liveTrading}
+          onLiveEnabledChange={(v) => bot.updateConfig({ liveTrading: v })}
+          running={running}
+          onLog={bot.log}
+        />
+
+        {bot.halted && (
+          <div className="rounded-md border border-rose-500/40 bg-rose-500/10 p-2.5">
+            <p className="text-xs font-semibold text-rose-300">
+              Bot detenido por seguridad
+            </p>
+            <p className="text-[11px] text-rose-200/80">{bot.haltReason}</p>
+            <p className="text-[10px] text-muted-foreground">
+              No se simuló ninguna orden. Revisa el saldo y las claves, y vuelve a
+              pulsar Start.
+            </p>
+          </div>
+        )}
 
         {/* Stored coins / open lots */}
         <div className="space-y-2">
