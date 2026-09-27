@@ -497,7 +497,7 @@ log(
         'stopLossPct',
         'trailingPct',
         'tickIntervalMs',
-        'compound',
+        'liveTrading',
       ]
       const next: Partial<CoinState> = {}
       for (const k of allowed) {
@@ -505,7 +505,8 @@ log(
           ;(next as Record<string, unknown>)[k] = (patch as Record<string, unknown>)[k]
         }
       }
-      return { ...s, ...next }
+      // Interest compounding is mandatory: the patch can never turn it off.
+      return { ...s, ...next, compound: true }
     })
   }, [])
 

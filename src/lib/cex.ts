@@ -236,7 +236,54 @@ export interface KrakenOrderOpts {
   price?: number // required when ordertype === 'limit'
 }
 
+export interface KrakenOrderFilters {
+  /** Minimum order cost in the quote currency (Kraken `costmin`). */
+  costmin: number
+  /** Minimum order volume in the base asset (Kraken `ordermin`). */
+  ordermin: number
+  /** Smallest tradable volume increment (10^-pair_decimals). */
+  lot: number
+}
+
+/** Order constraints for a pair — honoured before sending any real order. */
+export async function krakenOrderFilters(pair: string): Promise<KrakenOrderFilters> {
+  const fallback: KrakenOrderFilters = { costmin: 0, ordermin: 0, lot: 0.00000001 }
+  try {
+    const res = await fetch(
+      `https://api.kraken.com/0/public/AssetPairs?pair=${encodeURIComponent(pair)}`
+    )
+    if (!res.ok) return fallback
+    const j = (await res.json()) as {
+      error: string[]
+      result?: Record<
+        string,
+        { costmin?: number; ordermin?: number; pair_decimals?: number }
+      >
+    }
+    if (Array.isArray(j.error) && j.error.length > 0) return fallback
+    const first = j.result ? Object.values(j.result)[0] : undefined
+    if (!first) return fallback
+    return {
+      costmin: Number(first.costmin ?? 0) || 0,
+      ordermin: Number(first.ordermin ?? 0) || 0,
+      lot: first.pair_decimals != null ? Math.pow(10, -first.pair_decimals) : fallback.lot,
+    }
+  } catch {
+    return fallback
+  }
+}
+
+/** Round a base-asset volume down to the pair's tradable increment. */
+export function krakenRoundVolume(volume: number, filters: KrakenOrderFilters): number {
+  const lot = filters.lot > 0 ? filters.lot : 0.00000001
+  const rounded = Math.floor(volume / lot) * lot
+  // Re-parse to avoid binary float dust like 0.30000000000000004.
+  return Number(rounded.toFixed(8))
+}
+
 export async function krakenMarketOrder(opts: KrakenOrderOpts): Promise<ExchangeOrderResult> {
+  const volume = Number(opts.volume.toFixed(8))
+  if (!(volume > 0)) throw new Error("volume must be > 0")
   const result = (await krakenSignedPost(
     "/0/private/AddOrder",
     {
@@ -244,19 +291,45 @@ export async function krakenMarketOrder(opts: KrakenOrderOpts): Promise<Exchange
       type: opts.side,
       ordertype: opts.ordertype ?? "market",
       ...(opts.ordertype === "limit" && opts.price ? { price: String(opts.price) } : {}),
-      volume: Number(opts.volume.toFixed(8)),
+      volume,
       oflags: "fciq",
     },
     opts.cred
   )) as { txid: string[] }
+  const txid = (result.txid ?? [])[0]
+  if (!txid) throw new Error("Kraken did not return an order id")
+
+  // AddOrder only acknowledges the order. Query it so callers get the real
+  // filled volume and cost instead of assuming the whole amount filled.
+  let executedQty = 0
+  let executedQuote = 0
+  let price = 0
+  try {
+    const q = (await krakenSignedPost("/0/private/QueryOrders", { txid }, opts.cred)) as Record<
+      string,
+      { vol_exec?: string; cost?: string; price?: string; status?: string }
+    >
+    const o = q[txid]
+    if (o) {
+      executedQty = parseFloat(o.vol_exec ?? "0") || 0
+      executedQuote = parseFloat(o.cost ?? "0") || 0
+      price = parseFloat(o.price ?? "0") || 0
+    }
+  } catch {
+    // Order placed but not verifiable — report zero fills so the bot halts
+    // rather than assuming a position it cannot confirm.
+  }
+  if (price > 0 && executedQty > 0 && executedQuote === 0) {
+    executedQuote = price * executedQty
+  }
   return {
-    orderId: (result.txid ?? ["?"])[0] ?? "?",
+    orderId: txid,
     symbol: opts.pair,
     side: opts.side === "buy" ? "BUY" : "SELL",
     type: (opts.ordertype ?? "market").toUpperCase() as "MARKET",
-    executedQty: opts.volume,
-    executedQuote: 0,
-    price: 0,
+    executedQty,
+    executedQuote,
+    price: price > 0 ? price : executedQty > 0 ? executedQuote / executedQty : 0,
   }
 }
 
@@ -267,6 +340,22 @@ export function krakenBaseAsset(token: string): string {
   if (token === "LTC") return "XLTC"
   if (["ETH", "XRP", "ADA", "DOT", "LINK", "SOL", "EUR", "USD"].includes(token)) return token
   return token
+}
+
+/**
+ * Free USD balance on Kraken. The REST API names fiat USD `ZUSD` and also
+ * exposes a `USD` alias, so accept either (or the USDT/USDC stables) and sum
+ * the first one that actually holds funds.
+ */
+export function krakenUsdFree(balances: ExchangeBalance[]): number {
+  const find = (keys: string[]): number => {
+    for (const k of keys) {
+      const b = balances.find((x) => x.symbol.toUpperCase() === k)
+      if (b && b.free > 0) return b.free
+    }
+    return 0
+  }
+  return find(["ZUSD", "USD"]) || find(["USDT", "USDC"])
 }
 
 // ================= shared helpers (real mode) =================

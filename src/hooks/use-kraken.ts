@@ -29,6 +29,15 @@ import type {
   KrakenTriangleRoute,
 } from '@/lib/kraken'
 import type { EquityPoint } from '@/lib/trading-types'
+import {
+  krakenGetBalances,
+  krakenMarketOrder,
+  krakenOrderFilters,
+  krakenRoundVolume,
+  krakenUsdFree,
+  loadCreds,
+  type ExchangeCredentials,
+} from '@/lib/cex'
 
 const PRICE_HISTORY_CAP = 60
 const TRADE_CAP = 200
@@ -76,6 +85,15 @@ export interface KrakenHolding {
   soldAt?: number
   sellPrice?: number
   pnlUsd?: number
+  /** LIVE only: base quantity actually filled on Kraken. */
+  realBaseQty?: number
+  /** LIVE only: quote amount actually paid (BUY) or received (SELL). */
+  realQuoteUsd?: number
+  /** LIVE only: real Kraken order ids (txid) for reconciliation. */
+  realOrderId?: string
+  realExitOrderId?: string
+  /** LIVE only: the USD pair the position was opened on. */
+  realPair?: string
 }
 
 export interface KrakenTrade {
@@ -136,6 +154,13 @@ export interface KrakenState {
   opps: (KrakenArbOpportunity)[]
   lastUpdatedAt: number | null
   dataSource: 'live' | 'mock'
+  /**
+   * LIVE safety latch. A rejected real order (no funds, below the pair minimum,
+   * API error) stops the bot and records why. It never silently falls back to
+   * the simulated engine while real money is at stake.
+   */
+  halted: boolean
+  haltReason: string | null
 }
 
 export interface KrakenArbOpportunity {
@@ -228,6 +253,8 @@ export function useKrakenBot() {
       opps: [],
       lastUpdatedAt: null,
       dataSource: 'mock',
+      halted: false,
+      haltReason: null,
     }
   })
 
@@ -243,6 +270,29 @@ export function useKrakenBot() {
     }))
     console[level === 'trade' ? 'log' : level](`[kraken] ${msg}`)
   }, [])
+
+  /**
+   * Stop the bot and surface why. Triggered whenever a REAL order path fails:
+   * with real money we halt and warn rather than keep simulating.
+   */
+  const halt = useCallback(
+    (reason: string) => {
+      if (loopRef.current) {
+        clearInterval(loopRef.current)
+        loopRef.current = null
+      }
+      setState((s) => ({
+        ...s,
+        enabled: false,
+        halted: true,
+        haltReason: reason,
+        status: 'paused',
+        stats: s.stats ? { ...s.stats, running: false } : s.stats,
+      }))
+      log(`⛔ BOT DETENIDO (live): ${reason}`, 'error')
+    },
+    [log]
+  )
 
   const scan = useCallback(async () => {
     if (inFlightRef.current) return
@@ -300,6 +350,23 @@ export function useKrakenBot() {
       const trades = [...stateRef.current.trades]
       const opps: KrakenArbOpportunity[] = []
 
+      // LIVE: mirror the real USD balance (Kraken reports fiat USD as ZUSD).
+      let cred: ExchangeCredentials | null = null
+      let realTrades = 0
+      if (cfg.liveTrading) {
+        cred = loadCreds('kraken')
+        if (!cred || !cred.apiKey || !cred.apiSecret) {
+          halt('faltan credenciales de Kraken (API key + secret)')
+          return
+        }
+        try {
+          cash = krakenUsdFree(await krakenGetBalances(cred))
+        } catch (e) {
+          halt(`no se pudo leer el saldo real: ${(e as Error).message}`)
+          return
+        }
+      }
+
       for (const h of holdings) {
         if (h.status !== 'open') continue
         const route = KRAKEN_TRIANGLES.find((r) => r.id === h.routeId)
@@ -325,6 +392,76 @@ export function useKrakenBot() {
         }
 
         if (reason) {
+          // LIVE: close the real position on the same USD pair it was opened
+          // on, using the base quantity Kraken actually filled.
+          if (cfg.liveTrading && cred) {
+            const qty = h.realBaseQty ?? 0
+            const pair = h.realPair
+            if (!(qty > 0) || !pair) {
+              halt(`posición ${h.routeName} sin cantidad/par real registrado; no se puede cerrar`)
+              return
+            }
+            let order
+            try {
+              order = await krakenMarketOrder({ cred, pair, side: 'sell', volume: qty })
+            } catch (e) {
+              halt(`orden SELL ${pair} rechazada: ${(e as Error).message}`)
+              return
+            }
+            if (order.executedQty <= 0) {
+              halt(`orden SELL ${pair} sin fills (${order.orderId})`)
+              return
+            }
+            const proceeds = order.executedQuote
+            h.realExitOrderId = order.orderId
+            h.sellPrice = order.price
+            h.currentPrice = order.price
+            h.realQuoteUsd = proceeds
+            const pnl = proceeds - h.notionalUsd
+            const pnlBps = Math.round((pnl / h.notionalUsd) * 10000)
+            h.status = 'sold'
+            h.soldAt = now
+            h.pnlUsd = pnl
+            cash += proceeds
+            trades.unshift({
+              id: `krt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+              type: 'sell',
+              routeId: h.routeId,
+              routeName: h.routeName,
+              token: h.token,
+              priceUsd: order.price,
+              notionalUsd: h.notionalUsd,
+              pnlUsd: pnl,
+              profitBps: pnlBps,
+              reason: `${reason} (real)`,
+              status: 'filled',
+              createdAt: now,
+            })
+            opps.unshift({
+              id: `krp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+              routeId: h.routeId,
+              name: h.routeName,
+              side: h.side,
+              buyPrice: h.buyPrice,
+              sellPrice: order.price,
+              spreadBps: pnlBps,
+              notionalUsd: h.notionalUsd,
+              profitUsd: pnl,
+              detectedAt: now,
+              executed: true,
+            })
+            log(
+              `LIVE SELL ${pair} ${order.executedQty} @ ${order.price.toFixed(6)} → ${fmtUsdKraken(proceeds, 2)} USD (${pnl >= 0 ? '+' : ''}${fmtUsdKraken(pnl, 2)})`,
+              'trade'
+            )
+            log(
+              `⚡ Interés compuesto: capital disponible → ${fmtUsdKraken(cash, 2)} USD (P&L real ${pnl >= 0 ? '+' : ''}${fmtUsdKraken(pnl, 2)})`,
+              'info'
+            )
+            realTrades++
+            continue
+          }
+
           const pnl = (cur - h.buyPrice) * (h.notionalUsd / h.buyPrice)
           const pnlBps = Math.round(((cur - h.buyPrice) / h.buyPrice) * 10000)
           h.status = 'sold'
@@ -402,6 +539,95 @@ export function useKrakenBot() {
         const sellPrice = crossCheap ? s.directUsd : s.impliedUsd
         const profitUsd = ((sellPrice - buyPrice) / buyPrice) * notional
 
+        // LIVE: Kraken sizes orders in the BASE asset, so the USD notional has
+        // to be converted with the live quote and the pair minimums respected.
+        // Execution always happens on the USD leg of the route, which keeps
+        // the position a single asset denominated in USD.
+        if (cfg.liveTrading && cred) {
+          const pair = route.directSymbol
+          const price = raw[pair] ?? 0
+          if (!(price > 0)) {
+            halt(`sin precio en vivo para ${pair}; no se puede dimensionar la orden`)
+            return
+          }
+          const filters = await krakenOrderFilters(pair).catch(() => null)
+          const lot = filters ? krakenRoundVolume(notional / price, filters) : notional / price
+          if (filters && (filters.costmin > 0 && notional < filters.costmin ||
+                          filters.ordermin > 0 && lot < filters.ordermin)) {
+            log(
+              `⏭ ${route.name}: ${fmtUsdKraken(notional, 2)} USD / ${lot} ${route.token} por debajo del mínimo de Kraken (${filters.costmin} USD / ${filters.ordermin}) — se omite`,
+              'warn'
+            )
+            continue
+          }
+          if (!(lot > 0)) continue
+          let order
+          try {
+            order = await krakenMarketOrder({ cred, pair, side: 'buy', volume: lot })
+          } catch (e) {
+            halt(`orden BUY ${pair} rechazada: ${(e as Error).message}`)
+            return
+          }
+          if (order.executedQty <= 0) {
+            halt(`orden BUY ${pair} sin fills (${order.orderId})`)
+            return
+          }
+          const spent = order.executedQuote
+          const fillPrice = order.price
+          holdings.unshift({
+            id: `krh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            routeId: route.id,
+            routeName: route.name,
+            token: route.token,
+            side: crossCheap ? 'cross_cheap' : 'direct_cheap',
+            buyPrice: fillPrice,
+            currentPrice: fillPrice,
+            peakPrice: fillPrice,
+            notionalUsd: spent,
+            status: 'open',
+            boughtAt: now,
+            realBaseQty: order.executedQty,
+            realQuoteUsd: spent,
+            realOrderId: order.orderId,
+            realPair: pair,
+          })
+          trades.unshift({
+            id: `krt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            type: 'buy',
+            routeId: route.id,
+            routeName: route.name,
+            token: route.token,
+            priceUsd: fillPrice,
+            notionalUsd: spent,
+            pnlUsd: 0,
+            profitBps: s.spreadBps,
+            reason: `Divergence ${route.token}: ${s.directUsd.toFixed(6)} vs ${s.impliedUsd.toFixed(6)} (${s.spreadBps >= 0 ? '+' : ''}${s.spreadBps}bps) [real]`,
+            status: 'filled',
+            createdAt: now,
+          })
+          opps.unshift({
+            id: `krp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            routeId: route.id,
+            name: route.name,
+            side: crossCheap ? 'cross_cheap' : 'direct_cheap',
+            buyPrice: fillPrice,
+            sellPrice,
+            spreadBps: s.spreadBps,
+            notionalUsd: spent,
+            profitUsd,
+            detectedAt: now,
+            executed: true,
+          })
+          cash -= spent
+          buys++
+          realTrades++
+          log(
+            `LIVE BUY ${pair} ${order.executedQty} @ ${fillPrice.toFixed(6)} — ${fmtUsdKraken(spent, 2)} USD (${s.spreadBps >= 0 ? '+' : ''}${s.spreadBps}bps)`,
+            'trade'
+          )
+          continue
+        }
+
         holdings.unshift({
           id: `krh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           routeId: route.id,
@@ -448,6 +674,17 @@ export function useKrakenBot() {
           `${crossCheap ? 'IMPLIED' : 'DIRECT'} CHEAP — ${route.name}: buy ${buyPrice.toFixed(6)} → sell ${sellPrice.toFixed(6)} USD (${s.spreadBps >= 0 ? '+' : ''}${s.spreadBps}bps)`,
           'trade'
         )
+      }
+
+      // 3b. LIVE: re-read the real balance after trading so the displayed
+      // cash/equity is the exchange truth, not an approximation of the fills.
+      if (cfg.liveTrading && cred && realTrades > 0) {
+        try {
+          cash = krakenUsdFree(await krakenGetBalances(cred))
+        } catch (e) {
+          halt(`no se pudo reconciliar el saldo tras operar: ${(e as Error).message}`)
+          return
+        }
       }
 
       // 4. Stats
@@ -515,21 +752,36 @@ export function useKrakenBot() {
   }, [log])
 
   const start = useCallback(() => {
+    const cfg = stateRef.current.config
+    if (cfg.liveTrading) {
+      const c = loadCreds('kraken')
+      if (!c || !c.apiKey || !c.apiSecret) {
+        halt('modo live sin credenciales de Kraken — configura la API key y el secret')
+        return
+      }
+    }
     setState((s) => ({
       ...s,
       enabled: true,
+      halted: false,
+      haltReason: null,
       status: 'scanning',
       stats: s.stats ? { ...s.stats, running: true } : s.stats,
     }))
     log(
-      `KRAKEN BOT iniciado — ${stateRef.current.config.capitalUsd.toFixed(2)} USD ficticios, triangle arb`,
+      cfg.liveTrading
+        ? `KRAKEN BOT iniciado en MODO LIVE — triangle arb con órdenes reales en ${cfg.capitalUsd.toFixed(2)} USD`
+        : `KRAKEN BOT iniciado — ${cfg.capitalUsd.toFixed(2)} USD ficticios, triangle arb`,
       'trade'
     )
     if (loopRef.current) clearInterval(loopRef.current)
     loopRef.current = setInterval(() => {
-      scan().catch((e) => log(`Scan error: ${e.message}`, 'error'))
-    }, stateRef.current.config.tickIntervalMs)
-  }, [scan, log])
+      scan().catch((e) => {
+        if (stateRef.current.config.liveTrading) halt(`error inesperado: ${e.message}`)
+        else log(`Scan error: ${e.message}`, 'error')
+      })
+    }, cfg.tickIntervalMs)
+  }, [scan, log, halt])
 
   const stop = useCallback(() => {
     setState((s) => ({ ...s, enabled: false, status: 'idle' }))
@@ -545,6 +797,8 @@ export function useKrakenBot() {
     setState((s) => ({
       ...s,
       enabled: false,
+      halted: false,
+      haltReason: null,
       status: 'idle',
       cashUsd: cfg.capitalUsd,
       holdings: [],
@@ -563,7 +817,8 @@ export function useKrakenBot() {
 
   const updateConfig = useCallback((patch: Partial<KrakenConfig>) => {
     setState((s) => {
-      const next = { ...s.config, ...patch }
+      // Interest compounding is mandatory: the patch can never turn it off.
+      const next = { ...s.config, ...patch, compound: true }
       if (patch.capitalUsd !== undefined && !s.enabled) {
         return { ...s, config: next, cashUsd: patch.capitalUsd }
       }
@@ -586,6 +841,7 @@ export function useKrakenBot() {
     updateConfig,
     resetAccount,
     log,
+    halt,
   }
 }
 

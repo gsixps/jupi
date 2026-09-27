@@ -41,6 +41,8 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Switch } from '@/components/ui/switch'
 import type { useBinanceBot } from '@/hooks/use-binance'
+import { ExchangeKeysPanel } from '@/components/cex/ExchangeKeysPanel'
+import { verifyBinanceKeys } from '@/lib/cex'
 import { fmtUsd, fmtTime, fmtPct, fmtDuration, fmtBps } from '@/lib/format'
 
 interface BinanceTradingPanelProps {
@@ -453,15 +455,38 @@ export function BinanceTradingPanel({ binance }: BinanceTradingPanelProps) {
                 </p>
               </div>
               <Switch
-                checked={binance.config.compound}
-                onCheckedChange={(v) => binance.updateConfig({ compound: v })}
-                disabled={running}
+                checked
+                disabled
+                title="Interest compounding is always on"
               />
             </div>
           </div>
         </div>
 
         <Separator />
+
+        {/* Real-mode connection */}
+        <ExchangeKeysPanel
+          kind="binance"
+          verify={verifyBinanceKeys}
+          liveEnabled={binance.config.liveTrading}
+          onLiveEnabledChange={(v) => binance.updateConfig({ liveTrading: v })}
+          running={running}
+          onLog={binance.log}
+        />
+
+        {binance.halted && (
+          <div className="rounded-md border border-rose-500/40 bg-rose-500/10 p-2.5">
+            <p className="text-xs font-semibold text-rose-300">
+              Bot detenido por seguridad
+            </p>
+            <p className="text-[11px] text-rose-200/80">{binance.haltReason}</p>
+            <p className="text-[10px] text-muted-foreground">
+              No se simuló ninguna orden. Revisa el saldo y las claves, y vuelve a
+              pulsar Start.
+            </p>
+          </div>
+        )}
 
         {/* Open arbs */}
         <div className="space-y-2">

@@ -404,9 +404,9 @@ export function CoinTradingPanel({ bot }: CoinTradingPanelProps) {
                 </p>
               </div>
               <Switch
-                checked={bot.compound}
-                onCheckedChange={(v) => bot.updateConfig({ compound: v })}
-                disabled={running}
+        checked
+        disabled
+        title="Interest compounding is always on"
               />
             </div>
           </div>

@@ -385,9 +385,9 @@ export function PumpFunTradingPanel({ bot }: PumpFunTradingPanelProps) {
                 </p>
               </div>
               <Switch
-                checked={bot.config.compound}
-                onCheckedChange={(v) => bot.updateConfig({ compound: v })}
-                disabled={running}
+        checked
+        disabled
+        title="Interest compounding is always on"
               />
             </div>
           </div>

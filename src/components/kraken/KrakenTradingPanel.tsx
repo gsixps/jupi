@@ -42,6 +42,8 @@ import {
 import { Switch } from '@/components/ui/switch'
 import type { useKrakenBot } from '@/hooks/use-kraken'
 import { fmtUsd, fmtTime, fmtPct, fmtDuration, fmtBps } from '@/lib/format'
+import { ExchangeKeysPanel } from '@/components/cex/ExchangeKeysPanel'
+import { verifyKrakenKeys } from '@/lib/cex'
 
 interface KrakenTradingPanelProps {
   kraken: ReturnType<typeof useKrakenBot>
@@ -453,15 +455,38 @@ export function KrakenTradingPanel({ kraken }: KrakenTradingPanelProps) {
                 </p>
               </div>
               <Switch
-                checked={kraken.config.compound}
-                onCheckedChange={(v) => kraken.updateConfig({ compound: v })}
-                disabled={running}
+        checked
+        disabled
+        title="Interest compounding is always on"
               />
             </div>
           </div>
         </div>
 
         <Separator />
+
+        {/* Real-mode connection */}
+        <ExchangeKeysPanel
+          kind="kraken"
+          verify={verifyKrakenKeys}
+          liveEnabled={kraken.config.liveTrading}
+          onLiveEnabledChange={(v) => kraken.updateConfig({ liveTrading: v })}
+          running={running}
+          onLog={kraken.log}
+        />
+
+        {kraken.halted && (
+          <div className="rounded-md border border-rose-500/40 bg-rose-500/10 p-2.5">
+            <p className="text-xs font-semibold text-rose-300">
+              Bot detenido por seguridad
+            </p>
+            <p className="text-[11px] text-rose-200/80">{kraken.haltReason}</p>
+            <p className="text-[10px] text-muted-foreground">
+              No se simuló ninguna orden. Revisa el saldo y las claves, y vuelve a
+              pulsar Start.
+            </p>
+          </div>
+        )}
 
         {/* Open arbs */}
         <div className="space-y-2">

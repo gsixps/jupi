@@ -466,9 +466,9 @@ export function CurveTradingPanel({ curve }: CurveTradingPanelProps) {
                 </p>
               </div>
               <Switch
-                checked={curve.config.compound}
-                onCheckedChange={(v) => curve.updateConfig({ compound: v })}
-                disabled={running}
+        checked
+        disabled
+        title="Interest compounding is always on"
               />
             </div>
           </div>

@@ -86,6 +86,13 @@ export interface BinanceHolding {
   soldAt?: number
   sellPrice?: number
   pnlUsd?: number
+  /** LIVE only: base quantity actually filled on the exchange. */
+  realBaseQty?: number
+  /** LIVE only: quote amount actually paid (BUY) or received (SELL). */
+  realQuoteUsd?: number
+  /** LIVE only: real order ids, for reconciliation. */
+  realOrderId?: string
+  realExitOrderId?: string
 }
 
 export interface BinanceTrade {
@@ -146,6 +153,13 @@ export interface BinanceState {
   opps: BinanceArbOpportunity[]
   lastUpdatedAt: number | null
   dataSource: 'live' | 'mock'
+  /**
+   * LIVE safety latch. When a real order is rejected (insufficient balance,
+   * min notional, API error) the bot stops itself and records why. It NEVER
+   * falls back to the simulated engine with real money at stake.
+   */
+  halted: boolean
+  haltReason: string | null
 }
 
 /** Build price rows (live or mock). */
@@ -225,6 +239,8 @@ export function useBinanceBot() {
       opps: [],
       lastUpdatedAt: null,
       dataSource: 'mock',
+      halted: false,
+      haltReason: null,
     }
   })
 
@@ -240,6 +256,30 @@ export function useBinanceBot() {
     }))
     console[level === 'trade' ? 'log' : level](`[binance] ${msg}`)
   }, [])
+
+  /**
+   * Stop the bot for good (or until the user presses Start again) and surface
+   * the reason. Used whenever a REAL order path fails: with real money we
+   * would rather halt and warn than quietly keep simulating.
+   */
+  const halt = useCallback(
+    (reason: string) => {
+      if (loopRef.current) {
+        clearInterval(loopRef.current)
+        loopRef.current = null
+      }
+      setState((s) => ({
+        ...s,
+        enabled: false,
+        halted: true,
+        haltReason: reason,
+        status: 'paused',
+        stats: s.stats ? { ...s.stats, running: false } : s.stats,
+      }))
+      log(`⛔ BOT DETENIDO (live): ${reason}`, 'error')
+    },
+    [log]
+  )
 
   const scan = useCallback(async () => {
     if (inFlightRef.current) return
@@ -298,6 +338,30 @@ export function useBinanceBot() {
       const trades = [...stateRef.current.trades]
       const opps: BinanceArbOpportunity[] = []
 
+      // LIVE: resolve the credential once per scan and mirror the real USDT
+      // balance so `cash` always matches what the exchange actually holds.
+      let cred: ExchangeCredentials | null = null
+      let realTrades = 0
+      if (cfg.liveTrading) {
+        cred = loadCreds('binance')
+        if (!cred || !cred.apiKey || !cred.apiSecret) {
+          halt('faltan credenciales de Binance (API key + secret)')
+          return
+        }
+        try {
+          const bals = await binanceGetBalances(cred)
+          const usdt = bals.find((b) => b.symbol === 'USDT')
+          if (!usdt) {
+            halt('la cuenta de Binance no tiene saldo en USDT')
+            return
+          }
+          cash = usdt.free
+        } catch (e) {
+          halt(`no se pudo leer el saldo real: ${(e as Error).message}`)
+          return
+        }
+      }
+
       for (const h of holdings) {
         if (h.status !== 'open') continue
         const route = BINANCE_TRIANGLES.find((r) => r.id === h.routeId)
@@ -323,6 +387,77 @@ export function useBinanceBot() {
         }
 
         if (reason) {
+          // LIVE: the exit is a real SELL of the base quantity we actually
+          // received. Use the exchange fill as the source of truth for P&L.
+          if (cfg.liveTrading && cred) {
+            const qty = h.realBaseQty ?? 0
+            if (qty <= 0) {
+              halt(`posición ${h.routeName} sin cantidad real registrada; no se puede cerrar`)
+              return
+            }
+            const symbol = `${h.token}USDT`
+            let order
+            try {
+              order = await binanceMarketOrder({ cred, symbol, side: 'SELL', sellBaseQty: qty })
+            } catch (e) {
+              halt(`orden SELL ${symbol} rechazada: ${(e as Error).message}`)
+              return
+            }
+            if (order.executedQty <= 0) {
+              halt(`orden SELL ${symbol} sin fills (${order.orderId})`)
+              return
+            }
+            const proceeds = order.executedQuote
+            h.realExitOrderId = order.orderId
+            h.realBaseQty = order.executedQty
+            h.realQuoteUsd = proceeds
+            h.sellPrice = order.price
+            h.currentPrice = order.price
+            const pnl = proceeds - h.notionalUsd
+            h.soldAt = now
+            h.status = 'sold'
+            h.pnlUsd = pnl
+            cash += proceeds
+            const pnlBps = Math.round((pnl / h.notionalUsd) * 10000)
+            trades.unshift({
+              id: `bnt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+              type: 'sell',
+              routeId: h.routeId,
+              routeName: h.routeName,
+              token: h.token,
+              priceUsd: order.price,
+              notionalUsd: h.notionalUsd,
+              pnlUsd: pnl,
+              profitBps: pnlBps,
+              reason: `${reason} (real)`,
+              status: 'filled',
+              createdAt: now,
+            })
+            opps.unshift({
+              id: `bnp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+              routeId: h.routeId,
+              name: h.routeName,
+              side: h.side,
+              buyPrice: h.buyPrice,
+              sellPrice: order.price,
+              spreadBps: pnlBps,
+              notionalUsd: h.notionalUsd,
+              profitUsd: pnl,
+              detectedAt: now,
+              executed: true,
+            })
+            log(
+              `LIVE SELL ${symbol} ${order.executedQty} @ ${order.price.toFixed(6)} → ${fmtUsdLocal(proceeds, 2)} USD (${pnl >= 0 ? '+' : ''}${fmtUsdLocal(pnl, 2)})`,
+              'trade'
+            )
+            log(
+              `⚡ Interés compuesto: capital disponible → ${fmtUsdLocal(cash, 2)} USD (P&L real ${pnl >= 0 ? '+' : ''}${fmtUsdLocal(pnl, 2)})`,
+              'info'
+            )
+            realTrades++
+            continue
+          }
+
           const pnl = (cur - h.buyPrice) * (h.notionalUsd / h.buyPrice)
           const pnlBps = Math.round(((cur - h.buyPrice) / h.buyPrice) * 10000)
           h.status = 'sold'
@@ -400,6 +535,84 @@ export function useBinanceBot() {
         const sellPrice = crossCheap ? s.directUsd : s.impliedUsd
         const profitUsd = ((sellPrice - buyPrice) / buyPrice) * notional
 
+        // LIVE: place the real BUY first — the simulated position below is
+        // only created from the actual fill.
+        if (cfg.liveTrading && cred) {
+          const symbol = `${route.token}USDT`
+          const minNotional = await binanceMinNotional(symbol).catch(() => 0)
+          if (minNotional > 0 && notional < minNotional) {
+            log(
+              `⏭ ${route.name}: ${fmtUsdLocal(notional, 2)} USD < mínimo de Binance (${fmtUsdLocal(minNotional, 2)}) — se omite esta señal`,
+              'warn'
+            )
+            continue
+          }
+          let order
+          try {
+            order = await binanceMarketOrder({ cred, symbol, side: 'BUY', buyQuoteUsd: notional })
+          } catch (e) {
+            halt(`orden BUY ${symbol} rechazada: ${(e as Error).message}`)
+            return
+          }
+          if (order.executedQty <= 0) {
+            halt(`orden BUY ${symbol} sin fills (${order.orderId})`)
+            return
+          }
+          const spent = order.executedQuote
+          const fillPrice = order.price
+          holdings.unshift({
+            id: `bnh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            routeId: route.id,
+            routeName: route.name,
+            token: route.token,
+            side: crossCheap ? 'cross_cheap' : 'direct_cheap',
+            buyPrice: fillPrice,
+            currentPrice: fillPrice,
+            peakPrice: fillPrice,
+            notionalUsd: spent,
+            status: 'open',
+            boughtAt: now,
+            realBaseQty: order.executedQty,
+            realQuoteUsd: spent,
+            realOrderId: order.orderId,
+          })
+          trades.unshift({
+            id: `bnt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            type: 'buy',
+            routeId: route.id,
+            routeName: route.name,
+            token: route.token,
+            priceUsd: fillPrice,
+            notionalUsd: spent,
+            pnlUsd: 0,
+            profitBps: s.spreadBps,
+            reason: `Divergence ${route.token}: ${s.directUsd.toFixed(6)} vs ${s.impliedUsd.toFixed(6)} (${s.spreadBps >= 0 ? '+' : ''}${s.spreadBps}bps) [real]`,
+            status: 'filled',
+            createdAt: now,
+          })
+          opps.unshift({
+            id: `bnp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            routeId: route.id,
+            name: route.name,
+            side: crossCheap ? 'cross_cheap' : 'direct_cheap',
+            buyPrice: fillPrice,
+            sellPrice,
+            spreadBps: s.spreadBps,
+            notionalUsd: spent,
+            profitUsd,
+            detectedAt: now,
+            executed: true,
+          })
+          cash -= spent
+          buys++
+          log(
+            `LIVE BUY ${symbol} ${order.executedQty} @ ${fillPrice.toFixed(6)} — ${fmtUsdLocal(spent, 2)} USD (${s.spreadBps >= 0 ? '+' : ''}${s.spreadBps}bps)`,
+            'trade'
+          )
+          realTrades++
+          continue
+        }
+
         holdings.unshift({
           id: `bnh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           routeId: route.id,
@@ -446,6 +659,19 @@ export function useBinanceBot() {
           `${crossCheap ? 'IMPLIED' : 'DIRECT'} CHEAP — ${route.name}: buy ${buyPrice.toFixed(6)} → sell ${sellPrice.toFixed(6)} USD (${s.spreadBps >= 0 ? '+' : ''}${s.spreadBps}bps)`,
           'trade'
         )
+      }
+
+      // 3b. LIVE: re-read the real balance after trading so the displayed
+      // cash/equity is the exchange truth, not an approximation of the fills.
+      if (cfg.liveTrading && cred && realTrades > 0) {
+        try {
+          const bals = await binanceGetBalances(cred)
+          const usdt = bals.find((b) => b.symbol === 'USDT')
+          if (usdt) cash = usdt.free
+        } catch (e) {
+          halt(`no se pudo reconciliar el saldo tras operar: ${(e as Error).message}`)
+          return
+        }
       }
 
       // 4. Stats
@@ -510,21 +736,36 @@ export function useBinanceBot() {
   }, [log])
 
   const start = useCallback(() => {
+    const cfg = stateRef.current.config
+    if (cfg.liveTrading) {
+      const c = loadCreds('binance')
+      if (!c || !c.apiKey || !c.apiSecret) {
+        halt('modo live sin credenciales de Binance — configura la API key y el secret')
+        return
+      }
+    }
     setState((s) => ({
       ...s,
       enabled: true,
+      halted: false,
+      haltReason: null,
       status: 'scanning',
       stats: s.stats ? { ...s.stats, running: true } : s.stats,
     }))
     log(
-      `BINANCE BOT iniciado — ${stateRef.current.config.capitalUsd.toFixed(2)} USD ficticios, triangle arb`,
+      cfg.liveTrading
+        ? `BINANCE BOT iniciado en MODO LIVE — triangle arb con órdenes reales en ${cfg.capitalUsd.toFixed(2)} USD`
+        : `BINANCE BOT iniciado — ${cfg.capitalUsd.toFixed(2)} USD ficticios, triangle arb`,
       'trade'
     )
     if (loopRef.current) clearInterval(loopRef.current)
     loopRef.current = setInterval(() => {
-      scan().catch((e) => log(`Scan error: ${e.message}`, 'error'))
-    }, stateRef.current.config.tickIntervalMs)
-  }, [scan, log])
+      scan().catch((e) => {
+        if (stateRef.current.config.liveTrading) halt(`error inesperado: ${e.message}`)
+        else log(`Scan error: ${e.message}`, 'error')
+      })
+    }, cfg.tickIntervalMs)
+  }, [scan, log, halt])
 
   const stop = useCallback(() => {
     setState((s) => ({ ...s, enabled: false, status: 'idle' }))
@@ -540,6 +781,8 @@ export function useBinanceBot() {
     setState((s) => ({
       ...s,
       enabled: false,
+      halted: false,
+      haltReason: null,
       status: 'idle',
       cashUsd: cfg.capitalUsd,
       holdings: [],
@@ -581,6 +824,7 @@ export function useBinanceBot() {
     updateConfig,
     resetAccount,
     log,
+    halt,
   }
 }
 

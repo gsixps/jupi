@@ -448,9 +448,9 @@ export function SeabotTradingPanel({ seabot }: SeabotTradingPanelProps) {
                 </p>
               </div>
               <Switch
-                checked={seabot.config.compound}
-                onCheckedChange={(v) => seabot.updateConfig({ compound: v })}
-                disabled={running}
+        checked
+        disabled
+        title="Interest compounding is always on"
               />
             </div>
           </div>

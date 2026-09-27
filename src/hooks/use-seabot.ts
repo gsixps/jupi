@@ -370,7 +370,8 @@ export function useSeabot() {
 
   const updateConfig = useCallback((patch: Partial<SeabotConfig>) => {
     setState((s) => {
-      const next = { ...s.config, ...patch }
+      // Interest compounding is mandatory: the patch can never turn it off.
+      const next = { ...s.config, ...patch, compound: true }
       if (patch.capitalEth !== undefined && !s.enabled) {
         return { ...s, config: next, cashEth: patch.capitalEth }
       }
