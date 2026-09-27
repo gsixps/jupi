@@ -110,7 +110,7 @@ export function BotsProvider({ children }: { children: React.ReactNode }) {
   const kraken = useKrakenBot()
   const curve = useCurveBot()
   const seabot = useSeabot()
-  const pumpfun = usePumpFunBot()
+  const pumpfun = usePumpFunBot(wallet)
   const coinBtc = useCoinBot('btc')
   const coinEth = useCoinBot('eth')
   const bybit = useBybitBot()

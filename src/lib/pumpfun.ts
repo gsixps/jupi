@@ -13,10 +13,30 @@
 //   4. BUY coins that are cheap + opportunity-scored above the threshold.
 //   5. Update stats + log everything.
 //
-// Capital is FICTIONAL (USD). No real on-chain trades are executed.
+// Capital is FICTIONAL (USD) in demo mode. In live mode the bot executes real
+// Jupiter swaps, which requires a connected Phantom wallet AND a real on-chain
+// mint for the coin — so only coins whose mint is a genuine base58 address are
+// tradable.
 
 export const PUMPFUN_API_BASE =
   "https://frontend-api.pump.fun/coins?limit=40&offset=0&sort=created_timestamp&order=DESC&includeNsfw=false"
+
+/** Wrapped SOL mint — the funding side of every real swap. */
+export const WSOL_MINT = "So11111111111111111111111111111111111111112"
+export const SOL_DECIMALS = 9
+
+/** A Solana mint is a base58 address: 32–44 chars, no 0/O/I/l. */
+export function isValidMint(mint: string | null | undefined): boolean {
+  if (!mint) return false
+  if (mint.length < 32 || mint.length > 44) return false
+  return /^[1-9A-HJ-NP-Za-km-z]+$/.test(mint)
+}
+
+/** Lamports per token, from a USD notional and a USD unit price. */
+export function usdToBaseUnits(usd: number, priceUsd: number, decimals: number): number {
+  if (!(priceUsd > 0)) return 0
+  return Math.floor((usd / priceUsd) * Math.pow(10, decimals))
+}
 
 // ---- deterministic pseudo-random (same engine as the other bots) ----
 export function seededRandom(seed: string): number {
@@ -112,6 +132,12 @@ export interface PumpCoinRow {
   momentumPct: number // % change vs previous price
   score: number // 0..100 opportunity score
   verdict: 'buy' | 'hot' | 'neutral' | 'sell'
+  /**
+   * On-chain mint. Empty for the mock demo universe (those tokens do not
+   * exist), so live mode skips them instead of sending a doomed swap.
+   */
+  mint: string
+  decimals: number
 }
 
 export interface PumpOpportunity {

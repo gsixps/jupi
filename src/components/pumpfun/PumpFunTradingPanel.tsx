@@ -40,6 +40,7 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
+import { useWallet } from '@/hooks/use-wallet'
 import type { PumpFunBot } from '@/hooks/use-pumpfun'
 import { fmtUsd, fmtTime, fmtPct, fmtDuration, fmtBps } from '@/lib/format'
 
@@ -174,6 +175,7 @@ function TradeRow({ t }: { t: PumpFunBot['trades'][number] }) {
 export function PumpFunTradingPanel({ bot }: PumpFunTradingPanelProps) {
   const [confirmedThisSession, setConfirmedThisSession] = useState(false)
   const [capitalInput, setCapitalInput] = useState(String(bot.config.capitalUsd))
+  const wallet = useWallet()
 
   const stats = bot.stats
   const equity = stats?.equityUsd ?? bot.config.capitalUsd
@@ -394,6 +396,82 @@ export function PumpFunTradingPanel({ bot }: PumpFunTradingPanelProps) {
         </div>
 
         <Separator />
+
+        {/* Real-mode wallet */}
+        <div className="space-y-2 rounded-md border border-border/60 p-3">
+          <div className="flex items-center justify-between gap-2">
+            <div className="space-y-0.5">
+              <Label className="text-xs">Live trading (Phantom)</Label>
+              <p className="text-[10px] text-muted-foreground">
+                {wallet?.connected ? (
+                  <>
+                    Conectada:{' '}
+                    <span className="font-mono text-foreground">
+                      {wallet.shortAddress}
+                    </span>
+                  </>
+                ) : wallet?.installed ? (
+                  'Wallet instalada pero desconectada'
+                ) : (
+                  'Phantom no detectada en el navegador'
+                )}
+              </p>
+            </div>
+            <Switch
+              checked={bot.config.liveTrading}
+              onCheckedChange={(v) => bot.updateConfig({ liveTrading: v })}
+              disabled={running}
+            />
+          </div>
+          {bot.config.liveTrading && !wallet?.connected && (
+            <div className="space-y-1.5">
+              <Button
+                size="sm"
+                className="w-full"
+                onClick={() => wallet?.connect()}
+                disabled={!wallet?.installed || wallet?.connecting}
+              >
+                {wallet?.connecting ? 'Conectando…' : 'Conectar Phantom'}
+              </Button>
+              {!wallet?.installed && (
+                <p className="text-[10px] text-amber-400">
+                  Instala la extensión Phantom para operar con SOL real.
+                </p>
+              )}
+            </div>
+          )}
+          {bot.walletAddress && bot.config.liveTrading && (
+            <p className="text-[10px] text-muted-foreground">
+              {bot.solBalance !== null && (
+                <>
+                  Saldo on-chain:{' '}
+                  <span className="font-mono text-foreground">
+                    {bot.solBalance.toFixed(4)} SOL
+                  </span>{' '}
+                  ·{' '}
+                </>
+              )}
+              El bot opera desde{' '}
+              <span className="font-mono text-foreground">
+                {bot.walletAddress.slice(0, 4)}…{bot.walletAddress.slice(-4)}
+              </span>
+              . Cada swap pide aprobación en la ventana de Phantom.
+            </p>
+          )}
+        </div>
+
+        {bot.halted && (
+          <div className="rounded-md border border-rose-500/40 bg-rose-500/10 p-2.5">
+            <p className="text-xs font-semibold text-rose-300">
+              Bot detenido por seguridad
+            </p>
+            <p className="text-[11px] text-rose-200/80">{bot.haltReason}</p>
+            <p className="text-[10px] text-muted-foreground">
+              No se simuló ninguna orden. Revisa el saldo de SOL y la conexión, y
+              vuelve a pulsar Start.
+            </p>
+          </div>
+        )}
 
         {/* Open meme bags */}
         <div className="space-y-2">
