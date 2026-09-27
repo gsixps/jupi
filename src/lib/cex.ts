@@ -414,41 +414,224 @@ export async function bybitGetBalances(cred: ExchangeCredentials): Promise<Excha
   return out
 }
 
+/** Free USDT balance on Bybit. */
+export function bybitUsdtFree(balances: ExchangeBalance[]): number {
+  const b = balances.find((x) => x.symbol.toUpperCase() === 'USDT')
+  return b ? b.free : 0
+}
+
+/** Free balance of one coin on Bybit (e.g. the spot inventory of AAPLX). */
+export function bybitCoinFree(balances: ExchangeBalance[], coin: string): number {
+  const b = balances.find((x) => x.symbol.toUpperCase() === coin.toUpperCase())
+  return b ? b.free : 0
+}
+
 export interface BybitOrderOpts {
   cred: ExchangeCredentials
   category: 'spot' | 'linear'
   symbol: string
   side: 'Buy' | 'Sell'
+  /**
+   * Order size. Interpreted according to `marketUnit`:
+   *  - `quoteCoin` → the USDT notional to spend
+   *  - `baseCoin`  → the coin quantity to trade
+   * Linear perps are always sized in base coin, so the unit is ignored there.
+   */
   qty: number
-  /** Spot market buys are priced in USDT when marketUnit is quoteCoin. */
   marketUnit?: 'baseCoin' | 'quoteCoin'
   reduceOnly?: boolean
 }
 
-/** Place a Bybit v5 market order (spot or linear). */
+export interface BybitInstrumentFilters {
+  /** Minimum order value in the quote coin, in USDT. */
+  minOrderValueUsd: number
+  /** Minimum tradable base quantity. */
+  minOrderQty: number
+  /** Tradable base quantity increment. */
+  qtyStep: number
+  /** Tradable quote increment; 0 when the venue sizes orders in base coin only. */
+  quoteQtyStep: number
+  /** Maximum base quantity per market order. */
+  maxOrderQty: number
+}
+
+const BYBIT_FILTER_CACHE = new Map<string, BybitInstrumentFilters>()
+
+const BYBIT_FILTER_FALLBACK: BybitInstrumentFilters = {
+  minOrderValueUsd: 5,
+  minOrderQty: 0.00001,
+  qtyStep: 0.00001,
+  quoteQtyStep: 0.01,
+  maxOrderQty: Number.POSITIVE_INFINITY,
+}
+
+/** `basePrecision` / `quotePrecision` are decimal counts on spot, e.g. "0.001" → 3. */
+function precisionToStep(precision: string | undefined): number {
+  if (!precision) return 0
+  const n = parseFloat(precision)
+  if (!isFinite(n) || n <= 0) return 0
+  // 0.001 → 3 decimals; 0.00001 → 5 decimals.
+  const decimals = Math.round(-Math.log10(n))
+  return Number(Math.pow(10, -decimals).toPrecision(12))
+}
+
+/**
+ * Real order constraints for a symbol, read from `instruments-info`. Cached for
+ * the session because these only change when the instrument changes.
+ *
+ * The field names differ per category: spot exposes `minOrderAmt` plus
+ * `basePrecision`/`quotePrecision` (no `qtyStep`), while linear perps expose
+ * `minNotionalValue` and `qtyStep`. Both shapes are handled here.
+ */
+export async function bybitInstrumentFilters(
+  category: 'spot' | 'linear',
+  symbol: string
+): Promise<BybitInstrumentFilters> {
+  const key = `${category}:${symbol}`
+  const cached = BYBIT_FILTER_CACHE.get(key)
+  if (cached) return cached
+
+  const filters = await (async (): Promise<BybitInstrumentFilters> => {
+    try {
+      const res = await fetch(
+        `https://api.bybit.com/v5/market/instruments-info?category=${category}&symbol=${symbol}`
+      )
+      if (!res.ok) return BYBIT_FILTER_FALLBACK
+      const j = (await res.json()) as {
+        retCode: number
+        result?: {
+          list?: {
+            lotSizeFilter?: {
+              minOrderQty?: string
+              maxOrderQty?: string
+              qtyStep?: string
+              basePrecision?: string
+              quotePrecision?: string
+              minNotionalValue?: string
+              maxMktOrderQty?: string
+              maxMarketOrderQty?: string
+            }
+            minOrderValue?: string
+            minOrderAmt?: string
+          }[]
+        }
+      }
+      if (j.retCode !== 0 || !j.result?.list?.length) return BYBIT_FILTER_FALLBACK
+      const it = j.result.list[0]
+      const lot = it.lotSizeFilter ?? {}
+      const qtyStep = parseFloat(lot.qtyStep ?? '0') || precisionToStep(lot.basePrecision)
+      return {
+        minOrderValueUsd:
+          parseFloat(it.minOrderValue ?? lot.minNotionalValue ?? it.minOrderAmt ?? '0') || 0,
+        minOrderQty: parseFloat(lot.minOrderQty ?? '0') || 0,
+        qtyStep: qtyStep || BYBIT_FILTER_FALLBACK.qtyStep,
+        maxOrderQty:
+          parseFloat(
+            lot.maxMarketOrderQty ?? lot.maxMktOrderQty ?? lot.maxOrderQty ?? '0'
+          ) || BYBIT_FILTER_FALLBACK.maxOrderQty,
+        // Spot also accepts a USDT-sized order (quotePrecision); perps are
+        // always base sized, so the quote step is not applicable there.
+        quoteQtyStep:
+          category === 'spot'
+            ? precisionToStep(lot.quotePrecision) || BYBIT_FILTER_FALLBACK.quoteQtyStep
+            : 0,
+      }
+    } catch {
+      return BYBIT_FILTER_FALLBACK
+    }
+  })()
+
+  BYBIT_FILTER_CACHE.set(key, filters)
+  return filters
+}
+
+/** Round a base quantity down to the symbol's `qtyStep`. */
+export function bybitRoundQty(qty: number, filters: BybitInstrumentFilters): number {
+  const step = filters.qtyStep > 0 ? filters.qtyStep : BYBIT_FILTER_FALLBACK.qtyStep
+  const rounded = Math.floor(qty / step) * step
+  // Re-parse to strip binary float dust (0.30000000000000004 -> 0.3).
+  return Number(rounded.toPrecision(12))
+}
+
+/** Round a USDT notional down to the symbol's tradable quote increment. */
+export function bybitRoundQuote(
+  notionalUsd: number,
+  filters: BybitInstrumentFilters
+): number {
+  const step = filters.quoteQtyStep > 0 ? filters.quoteQtyStep : 0.01
+  const rounded = Math.floor(notionalUsd / step) * step
+  return Number(rounded.toPrecision(12))
+}
+
+/**
+ * Place a Bybit v5 market order (spot or linear) and report the REAL fill.
+ *
+ * `/v5/order/create` only acknowledges the order, so the order is then polled
+ * through `/v5/order/realtime` to read the executed quantity, quote amount and
+ * average price. If the fill cannot be confirmed the result reports zero fills
+ * so the caller halts instead of assuming a position it cannot verify.
+ */
 export async function bybitMarketOrder(opts: BybitOrderOpts): Promise<ExchangeOrderResult> {
   const params: Record<string, string | number | boolean> = {
     category: opts.category,
     symbol: opts.symbol,
     side: opts.side,
     orderType: 'Market',
-    qty: String(opts.qty),
     timeInForce: 'IOC',
-    ...(opts.category === 'spot' ? { marketUnit: opts.marketUnit ?? 'baseCoin' } : {}),
+    ...(opts.category === 'spot'
+      ? { marketUnit: opts.marketUnit ?? 'baseCoin', qty: String(opts.qty) }
+      : { qty: String(opts.qty) }),
     ...(opts.reduceOnly ? { reduceOnly: true } : {}),
   }
   const result = (await bybitSigned('POST', '/v5/order/create', params, opts.cred)) as {
     orderId: string
     orderLinkId: string
   }
+  const orderId = result.orderId ?? '?'
+
+  // Poll briefly: IOC market orders are normally filled immediately, but the
+  // snapshot can lag by a fraction of a second.
+  let executedQty = 0
+  let executedQuote = 0
+  let price = 0
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const q = (await bybitSigned(
+        'GET',
+        '/v5/order/realtime',
+        { category: opts.category, orderId },
+        opts.cred
+      )) as {
+        list?: {
+          cumExecQty?: string
+          cumExecValue?: string
+          avgPrice?: string
+          orderStatus?: string
+        }[]
+      }
+      const o = q.list?.[0]
+      if (o) {
+        executedQty = parseFloat(o.cumExecQty ?? '0') || 0
+        executedQuote = parseFloat(o.cumExecValue ?? '0') || 0
+        price = parseFloat(o.avgPrice ?? '0') || 0
+        if (executedQty > 0 || o.orderStatus === 'Filled' || o.orderStatus === 'Cancelled') break
+      }
+    } catch {
+      // fall through to the retry / zero-fill result
+    }
+    await new Promise((r) => setTimeout(r, 350))
+  }
+  if (price > 0 && executedQty > 0 && executedQuote === 0) {
+    executedQuote = price * executedQty
+  }
   return {
-    orderId: result.orderId ?? '?',
+    orderId,
     symbol: opts.symbol,
     side: opts.side === 'Buy' ? 'BUY' : 'SELL',
     type: 'MARKET',
-    executedQty: opts.qty,
-    executedQuote: 0,
-    price: 0,
+    executedQty,
+    executedQuote,
+    price: price > 0 ? price : executedQty > 0 ? executedQuote / executedQty : 0,
   }
 }
 

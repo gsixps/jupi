@@ -375,9 +375,9 @@ export function BybitTradingPanel({ bybit }: BybitTradingPanelProps) {
                 </p>
               </div>
               <Switch
-                checked={bybit.config.compound}
-                onCheckedChange={(v) => bybit.updateConfig({ compound: v })}
-                disabled={running}
+                checked
+                disabled
+                title="Interest compounding is always on"
               />
             </div>
           </div>

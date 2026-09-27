@@ -28,9 +28,15 @@ import {
   type BybitRwaRow,
 } from '@/lib/bybit'
 import {
+  bybitCoinFree,
   bybitGetBalances,
+  bybitInstrumentFilters,
   bybitMarketOrder,
+  bybitRoundQty,
+  bybitRoundQuote,
+  bybitUsdtFree,
   loadCreds,
+  type ExchangeBalance,
   type ExchangeCredentials,
 } from '@/lib/cex'
 import type { EquityPoint } from '@/lib/trading-types'
@@ -38,9 +44,6 @@ import type { EquityPoint } from '@/lib/trading-types'
 const PRICE_HISTORY_CAP = 60
 const TRADE_CAP = 200
 const LOG_CAP = 120
-
-/** Bybit spot market-order minimums are far above a cent; real mode respects them. */
-const BYBIT_MIN_NOTIONAL_USD = 5
 
 export interface BybitConfig {
   capitalUsd: number
@@ -94,12 +97,16 @@ export interface BybitHolding {
   notionalUsd: number
   /** Token quantity held on spot (0 when the spot leg was a short). */
   spotQty: number
+  /** Perp contract quantity, needed to size the closing (reduceOnly) order. */
+  perpQty: number
   status: 'open' | 'closed'
   openedAt: number
   closedAt?: number
   pnlUsd?: number
   /** Order id of the real spot order, when live. */
   realOrderId?: string
+  /** Order id of the real perp order, when live. */
+  realPerpOrderId?: string
 }
 
 export interface BybitTrade {
@@ -290,15 +297,17 @@ export function useBybitBot() {
       }
 
       let cash = s0.cashUsd
+      /** Live wallet snapshot — also used to check spot inventory. */
+      let bals: ExchangeBalance[] = []
       if (realMode && cred) {
-        const bals = await bybitGetBalances(cred)
-        const usdt = bals.find((b) => b.symbol === 'USDT')
-        if (!usdt) {
+        bals = await bybitGetBalances(cred)
+        const usdtFree = bybitUsdtFree(bals)
+        if (usdtFree <= 0) {
           inFlightRef.current = false
           halt('sin saldo USDT libre en la cuenta unificada de Bybit')
           return
         }
-        cash = usdt.free
+        cash = usdtFree
       }
 
       let holdings = s0.holdings.map((h) => ({ ...h }))
@@ -332,42 +341,63 @@ export function useBybitBot() {
         const pnl = (h.notionalUsd * (Math.abs(h.entryBasisBps) - Math.abs(cur))) / 10000
 
         if (realMode && cred) {
-          try {
-            if (h.spotSide === 'buy') {
-              await bybitMarketOrder({
-                cred,
-                category: 'spot',
-                symbol: h.spotSymbol,
-                side: 'Sell',
-                qty: roundQty(h.spotQty),
-                marketUnit: 'baseCoin',
-              })
-            } else {
-              await bybitMarketOrder({
-                cred,
-                category: 'spot',
-                symbol: h.spotSymbol,
-                side: 'Buy',
-                qty: roundUsd(h.notionalUsd, row.spotUsd),
-                marketUnit: 'quoteCoin',
-              })
-            }
-            await bybitMarketOrder({
+          const [spotF, perpF] = await Promise.all([
+            bybitInstrumentFilters('spot', h.spotSymbol),
+            bybitInstrumentFilters('linear', h.perpSymbol),
+          ])
+          // Close the hedge first: closing spot first would leave the perp naked
+          // for a moment. reduceOnly makes sure it can never open a reverse leg.
+          const perpQty = bybitRoundQty(Math.abs(h.perpQty), perpF)
+          if (perpQty > 0) {
+            const perpClose = await bybitMarketOrder({
               cred,
               category: 'linear',
               symbol: h.perpSymbol,
               side: h.perpSide === 'buy' ? 'Sell' : 'Buy',
-              qty: roundQty(h.notionalUsd / row.perpUsd),
+              qty: perpQty,
               reduceOnly: true,
             })
-            const bals2 = await bybitGetBalances(cred)
-            const u2 = bals2.find((b) => b.symbol === 'USDT')
-            if (u2) cash = u2.free
-          } catch (e) {
-            inFlightRef.current = false
-            halt(`cierre de ${h.token} rechazado por Bybit: ${(e as Error).message}`)
-            return
+            if (perpClose.executedQty <= 0) {
+              halt(
+                `cierre de ${h.token}: la pata perp ${perpClose.side} ${h.perpSymbol} no fills (orden ${perpClose.orderId})`
+              )
+              return
+            }
           }
+          if (h.spotSide === 'buy') {
+            const spotClose = await bybitMarketOrder({
+              cred,
+              category: 'spot',
+              symbol: h.spotSymbol,
+              side: 'Sell',
+              qty: bybitRoundQty(h.spotQty, spotF),
+              marketUnit: 'baseCoin',
+            })
+            if (spotClose.executedQty <= 0) {
+              halt(
+                `cierre de ${h.token}: la pata spot SELL ${h.spotSymbol} no fills (orden ${spotClose.orderId})`
+              )
+              return
+            }
+          } else {
+            // Re-buy the spot that was sold to open the hedge.
+            const spotClose = await bybitMarketOrder({
+              cred,
+              category: 'spot',
+              symbol: h.spotSymbol,
+              side: 'Buy',
+              qty: bybitRoundQuote(h.notionalUsd, spotF),
+              marketUnit: 'quoteCoin',
+            })
+            if (spotClose.executedQty <= 0) {
+              halt(
+                `cierre de ${h.token}: la pata spot BUY ${h.spotSymbol} no fills (orden ${spotClose.orderId})`
+              )
+              return
+            }
+          }
+          const bals2 = await bybitGetBalances(cred)
+          cash = bybitUsdtFree(bals2)
         }
 
         h.status = 'closed'
@@ -414,51 +444,106 @@ export function useBybitBot() {
 
         const notional = Math.min(cfg.budgetPerTradeUsd * compoundFactor, cash)
         if (notional < 0.01) continue
-        if (realMode && notional < BYBIT_MIN_NOTIONAL_USD) {
-          log(
-            `Omitido ${r.token}: ${fmtUsd(notional, 2)} USD < mínimo real de Bybit (${BYBIT_MIN_NOTIONAL_USD} USD)`,
-            'warn'
-          )
-          continue
-        }
+        // The real per-symbol minimum is checked further down, once the
+        // instrument filters for this pair are known.
 
         const perpRich = r.basisBps > 0
         const spotSide: 'buy' | 'sell' = perpRich ? 'buy' : 'sell'
         const perpSide: 'buy' | 'sell' = perpRich ? 'sell' : 'buy'
         const spotQty = notional / r.spotUsd
+        // Demo sizing; replaced by the real fill in live mode.
+        let bookedSpotQty = spotQty
+        let bookedPerpQty = notional / r.perpUsd
+        let bookedOrderId: string | undefined
+        let bookedPerpOrderId: string | undefined
 
         if (realMode && cred) {
-          try {
-            const spotOrder = await bybitMarketOrder({
-              cred,
-              category: 'spot',
-              symbol: r.spotSymbol,
-              side: spotSide === 'buy' ? 'Buy' : 'Sell',
-              qty:
-                spotSide === 'buy'
-                  ? roundUsd(notional, r.spotUsd)
-                  : roundQty(spotQty),
-              marketUnit: spotSide === 'buy' ? 'quoteCoin' : 'baseCoin',
-            })
-            await bybitMarketOrder({
-              cred,
-              category: 'linear',
-              symbol: r.perpSymbol,
-              side: perpSide === 'buy' ? 'Buy' : 'Sell',
-              qty: roundQty(notional / r.perpUsd),
-            })
-            const bals2 = await bybitGetBalances(cred)
-            const u2 = bals2.find((b) => b.symbol === 'USDT')
-            if (u2) cash = u2.free - investedBefore
+          // Real exchange filters, not a hardcoded guess: xStocks spot and the
+          // TradFi perps publish different lot/precision fields.
+          const [spotF, perpF] = await Promise.all([
+            bybitInstrumentFilters('spot', r.spotSymbol),
+            bybitInstrumentFilters('linear', r.perpSymbol),
+          ])
+
+          const minNotional = Math.max(spotF.minOrderValueUsd, perpF.minOrderValueUsd)
+          if (minNotional > 0 && notional < minNotional) {
             log(
-              `REAL ${spotSide === 'buy' ? 'BUY' : 'SELL'} ${r.spotSymbol} + ${perpSide === 'buy' ? 'BUY' : 'SELL'} ${r.perpSymbol} · orden ${spotOrder.orderId} · basis ${r.basisBps >= 0 ? '+' : ''}${r.basisBps}bps`,
-              'trade'
+              `Omitido ${r.token}: ${fmtUsd(notional, 2)} USD < mínimo real de Bybit (${fmtUsd(minNotional, 2)} USD)`,
+              'warn'
             )
-          } catch (e) {
-            inFlightRef.current = false
-            halt(`apertura de ${r.token} rechazada por Bybit: ${(e as Error).message}`)
+            continue
+          }
+
+          // A "sell spot / buy perp" leg needs spot inventory up front. Without
+          // it the spot sell would be rejected, so verify the balance before
+          // touching the market and skip the pair instead of getting naked.
+          let spotInventory = Infinity
+          if (spotSide === 'sell') {
+            spotInventory = bybitCoinFree(bals, r.token)
+            const needed = bybitRoundQty(spotQty, spotF)
+            if (needed <= 0 || spotInventory < needed) {
+              log(
+                `Omitido ${r.token}: la pata spot necesita ${needed} ${r.token} y la cuenta tiene ${spotInventory.toFixed(4)} (basis negativo requiere inventario spot)`,
+                'warn'
+              )
+              continue
+            }
+          }
+
+          const perpQty = bybitRoundQty(notional / r.perpUsd, perpF)
+          if (perpQty < (perpF.minOrderQty || 0)) {            log(
+              `Omitido ${r.token}: ${perpQty} ${r.token} por debajo del mínimo de ${r.perpSymbol} (${perpF.minOrderQty})`,
+              'warn'
+            )
+            continue
+          }
+
+          const spotOrder = await bybitMarketOrder({
+            cred,
+            category: 'spot',
+            symbol: r.spotSymbol,
+            side: spotSide === 'buy' ? 'Buy' : 'Sell',
+            // `quoteCoin` means the qty is a USDT amount — a base quantity
+            // there would buy a fraction of the intended size.
+            qty:
+              spotSide === 'buy'
+                ? bybitRoundQuote(notional, spotF)
+                : bybitRoundQty(spotQty, spotF),
+            marketUnit: spotSide === 'buy' ? 'quoteCoin' : 'baseCoin',
+          })
+          if (spotOrder.executedQty <= 0) {
+            halt(
+              `la pata spot ${spotOrder.side} ${r.spotSymbol} no fills (orden ${spotOrder.orderId})`
+            )
             return
           }
+          // Every filled unit carries risk: the perp is the hedge, so it must
+          // come in with a confirmed fill or the spot leg stays naked.
+          const perpOrder = await bybitMarketOrder({
+            cred,
+            category: 'linear',
+            symbol: r.perpSymbol,
+            side: perpSide === 'buy' ? 'Buy' : 'Sell',
+            qty: perpQty,
+          })
+          if (perpOrder.executedQty <= 0) {
+            halt(
+              `la pata perp ${perpOrder.side} ${r.perpSymbol} no fills (orden ${perpOrder.orderId}); la pata spot quedó sin cobertura`
+            )
+            return
+          }
+          const bals2 = await bybitGetBalances(cred)
+          cash = bybitUsdtFree(bals2)
+          // Book only what actually filled.
+          bookedSpotQty =
+            spotSide === 'buy' ? spotOrder.executedQty / (spotOrder.price || 1) : 0
+          bookedPerpQty = perpOrder.executedQty
+          bookedOrderId = spotOrder.orderId
+          bookedPerpOrderId = perpOrder.orderId
+          log(
+            `REAL ${spotSide === 'buy' ? 'BUY' : 'SELL'} ${r.spotSymbol} ${spotOrder.executedQty} @ ${spotOrder.price.toFixed(4)} + ${perpSide === 'buy' ? 'BUY' : 'SELL'} ${r.perpSymbol} ${perpOrder.executedQty} @ ${perpOrder.price.toFixed(4)} · basis ${r.basisBps >= 0 ? '+' : ''}${r.basisBps}bps`,
+            'trade'
+          )
         } else {
           cash -= notional
           log(
@@ -482,9 +567,12 @@ export function useBybitBot() {
           currentBasisBps: r.basisBps,
           peakBasisBps: r.basisBps,
           notionalUsd: notional,
-          spotQty,
+          spotQty: bookedSpotQty,
+          perpQty: bookedPerpQty,
           status: 'open',
           openedAt: now,
+          realOrderId: bookedOrderId,
+          realPerpOrderId: bookedPerpOrderId,
         })
         trades.unshift({
           id: `byt_${now}_${Math.random().toString(36).slice(2, 6)}`,
@@ -575,21 +663,34 @@ export function useBybitBot() {
         haltedReason: null,
       }))
     } catch (e) {
-      log(`error de scan: ${(e as Error).message}`, 'error')
+      // A real-money failure must stop the bot rather than be retried blindly.
+      if (stateRef.current.config.liveTrading) halt(`error de scan: ${(e as Error).message}`)
+      else log(`error de scan: ${(e as Error).message}`, 'error')
     } finally {
       inFlightRef.current = false
     }
   }, [halt, log])
 
   const start = useCallback(() => {
+    const cfg = stateRef.current.config
+    if (cfg.liveTrading && !loadCreds('bybit')) {
+      halt('modo live sin credenciales de Bybit — configura la API key y el secret')
+      return
+    }
     setState((s) => ({ ...s, enabled: true, status: 'scanning', haltedReason: null }))
+    log(
+      cfg.liveTrading
+        ? 'BYBIT RWA BOT iniciado en MODO LIVE — basis arb spot+perp con órdenes reales'
+        : 'BYBIT RWA BOT iniciado — basis arb spot+perp en modo demo',
+      'trade'
+    )
     if (loopRef.current) clearInterval(loopRef.current)
-    const ms = Math.max(3000, stateRef.current.config.tickIntervalMs)
+    const ms = Math.max(3000, cfg.tickIntervalMs)
     loopRef.current = setInterval(() => {
       void scan()
     }, ms)
     void scan()
-  }, [scan])
+  }, [scan, log, halt])
 
   const stop = useCallback(() => {
     if (loopRef.current) {
@@ -601,7 +702,8 @@ export function useBybitBot() {
 
   const updateConfig = useCallback((patch: Partial<BybitConfig>) => {
     setState((s) => {
-      const next = { ...s.config, ...patch }
+      // Interest compounding is mandatory: the patch can never turn it off.
+      const next = { ...s.config, ...patch, compound: true }
       if (patch.capitalUsd !== undefined && !s.enabled && !s.config.liveTrading) {
         return { ...s, config: next, cashUsd: patch.capitalUsd }
       }
@@ -642,17 +744,6 @@ export function useBybitBot() {
     resetAccount,
     log,
   }
-}
-
-/** Round a base-asset quantity to 4 decimals (xStocks quote ~4 dp). */
-function roundQty(q: number): number {
-  return Number(q.toFixed(4))
-}
-
-/** Convert a USD notional into a base quantity at the given price. */
-function roundUsd(usd: number, price: number): number {
-  if (!(price > 0)) return 0
-  return Number((usd / price).toFixed(4))
 }
 
 function fmtUsd(n: number, d = 2): string {
