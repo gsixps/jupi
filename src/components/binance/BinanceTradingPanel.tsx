@@ -322,6 +322,16 @@ export function BinanceTradingPanel({ binance }: BinanceTradingPanelProps) {
           </Button>
         </div>
 
+        {/* Real-mode API connection — right under the controls, always visible */}
+        <ExchangeKeysPanel
+          kind="binance"
+          verify={verifyBinanceKeys}
+          liveEnabled={binance.config.liveTrading}
+          onLiveEnabledChange={(v) => binance.updateConfig({ liveTrading: v })}
+          running={running}
+          onLog={binance.log}
+        />
+
         {/* Capital input (only editable when stopped) */}
         <div className="flex flex-wrap items-end gap-2 rounded-md border border-dashed border-border/60 p-2.5">
           <div className="space-y-1">
@@ -451,29 +461,18 @@ export function BinanceTradingPanel({ binance }: BinanceTradingPanelProps) {
                   Reinvest profits: per-trade budget scales with equity
                   {stats?.compound && stats.compoundFactor > 0
                     ? ` (×${stats.compoundFactor.toFixed(2)})`
-                    : ''}
+                    : ' (fixed budget)'}
                 </p>
               </div>
               <Switch
-                checked
-                disabled
-                title="Interest compounding is always on"
+                checked={binance.config.compound}
+                onCheckedChange={(v) => binance.updateConfig({ compound: v })}
               />
             </div>
           </div>
         </div>
 
         <Separator />
-
-        {/* Real-mode connection */}
-        <ExchangeKeysPanel
-          kind="binance"
-          verify={verifyBinanceKeys}
-          liveEnabled={binance.config.liveTrading}
-          onLiveEnabledChange={(v) => binance.updateConfig({ liveTrading: v })}
-          running={running}
-          onLog={binance.log}
-        />
 
         {binance.halted && (
           <div className="rounded-md border border-rose-500/40 bg-rose-500/10 p-2.5">

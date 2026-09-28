@@ -32,6 +32,7 @@ import { Slider } from '@/components/ui/slider'
 import { Label } from '@/components/ui/label'
 import { Input } from '@/components/ui/input'
 import { Separator } from '@/components/ui/separator'
+import { Switch } from '@/components/ui/switch'
 import {
   Alert,
   AlertDescription,
@@ -169,6 +170,11 @@ export function LiveTradingPanel({ live, wallet }: LiveTradingPanelProps) {
   const tb = live.tradingBalances
   const funded = live.fundingStatus === 'funded'
   const canStart = walletConnected && funded && (tb?.sol ?? 0) >= 0.001
+  // Compounding scales each trade off the live wallet balance; off means the
+  // size is a fixed percentage of the funded capital.
+  const liveCompound = live.config.compoundInterest
+  const compoundBase = liveCompound ? (tb?.usdc ?? 0) : live.config.capital
+  const nextTradeUsd = compoundBase * (live.config.tradeSizePct / 100)
 
   const handleStart = () => {
     setConfirmedThisSession(true)
@@ -372,7 +378,12 @@ export function LiveTradingPanel({ live, wallet }: LiveTradingPanelProps) {
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
           <StatTile label="Equity" value={fmtUsd(equity)} sub={`Started ${fmtUsd(live.config.capital)}`} />
           <StatTile label="Growth" value={fmtPct(stats?.totalPnlPct ?? 0)} sub={`${fmtUsd(totalPnl)} profit`} tone={pnlTone} />
-          <StatTile label="Next Trade Size" value={fmtUsd((tb?.usdc ?? 0) * (live.config.tradeSizePct / 100))} sub={`${live.config.tradeSizePct}% of $${(tb?.usdc ?? 0).toFixed(2)}`} tone="positive" />
+          <StatTile
+            label="Next Trade Size"
+            value={fmtUsd(nextTradeUsd)}
+            sub={`${live.config.tradeSizePct}% of $${compoundBase.toFixed(2)}${liveCompound ? ' (crece)' : ' (fijo)'}`}
+            tone="positive"
+          />
           <StatTile label="Win Rate" value={`${winRate.toFixed(1)}%`} sub={`${stats?.wins ?? 0}W / ${stats?.losses ?? 0}L`} tone={winRate >= 50 ? 'positive' : 'default'} />
         </div>
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
@@ -404,7 +415,22 @@ export function LiveTradingPanel({ live, wallet }: LiveTradingPanelProps) {
                   </div>
                   <Slider value={[val]} min={c.min} max={c.max} step={c.step} onValueChange={([v]) => live.updateConfig({ [c.key]: v } as never)} disabled={running} />
                   {c.key === 'tradeSizePct' && (
-                    <p className="text-[10px] text-emerald-400/80">↗ Scales with current balance — bigger trades as you profit.</p>
+                    <div className="flex items-center justify-between gap-2 rounded-md border border-dashed border-border/60 px-2 py-1.5">
+                      <div className="space-y-0.5">
+                        <Label className="text-[11px]">Compound interest</Label>
+                        <p className="text-[10px] text-muted-foreground">
+                          {liveCompound
+                            ? '↗ Reinvests profits: bigger trades as the wallet grows.'
+                            : '→ Fixed size from the funded capital.'}
+                        </p>
+                      </div>
+                      <Switch
+                        checked={liveCompound}
+                        onCheckedChange={(v) =>
+                          live.updateConfig({ compoundInterest: v })
+                        }
+                      />
+                    </div>
                   )}
                   {running && c.key !== 'tradeSizePct' && <p className="text-[10px] text-muted-foreground">Stop the bot to adjust.</p>}
                 </div>

@@ -809,8 +809,7 @@ export function useBybitBot() {
 
   const updateConfig = useCallback((patch: Partial<BybitConfig>) => {
     setState((s) => {
-      // Interest compounding is mandatory: the patch can never turn it off.
-      const next = { ...s.config, ...patch, compound: true }
+      const next = { ...s.config, ...patch }
       if (patch.capitalUsd !== undefined && !s.enabled && !s.config.liveTrading) {
         return { ...s, config: next, cashUsd: patch.capitalUsd }
       }

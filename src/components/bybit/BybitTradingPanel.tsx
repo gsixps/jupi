@@ -371,13 +371,12 @@ export function BybitTradingPanel({ bybit }: BybitTradingPanelProps) {
                   Reinvest profits: per-trade budget scales with equity
                   {stats?.compound && stats.compoundFactor > 0
                     ? ` (×${stats.compoundFactor.toFixed(3)})`
-                    : ''}
+                    : ' (fixed budget)'}
                 </p>
               </div>
               <Switch
-                checked
-                disabled
-                title="Interest compounding is always on"
+                checked={bybit.config.compound}
+                onCheckedChange={(v) => bybit.updateConfig({ compound: v })}
               />
             </div>
           </div>

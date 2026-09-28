@@ -462,13 +462,12 @@ export function CurveTradingPanel({ curve }: CurveTradingPanelProps) {
                   Reinvest profits: per-trade budget scales with equity
                   {stats?.compound && stats.compoundFactor > 0
                     ? ` (×${stats.compoundFactor.toFixed(2)})`
-                    : ''}
+                    : ' (fixed budget)'}
                 </p>
               </div>
               <Switch
-        checked
-        disabled
-        title="Interest compounding is always on"
+                checked={curve.config.compound}
+                onCheckedChange={(v) => curve.updateConfig({ compound: v })}
               />
             </div>
           </div>

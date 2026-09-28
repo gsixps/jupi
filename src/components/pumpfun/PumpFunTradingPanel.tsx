@@ -383,13 +383,12 @@ export function PumpFunTradingPanel({ bot }: PumpFunTradingPanelProps) {
                   Reinvest profits: per-trade budget scales with equity
                   {bot.stats?.compound && bot.stats.compoundFactor > 0
                     ? ` (×${bot.stats.compoundFactor.toFixed(2)})`
-                    : ''}
+                    : ' (fixed budget)'}
                 </p>
               </div>
               <Switch
-        checked
-        disabled
-        title="Interest compounding is always on"
+                checked={bot.config.compound}
+                onCheckedChange={(v) => bot.updateConfig({ compound: v })}
               />
             </div>
           </div>

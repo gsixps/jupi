@@ -1,12 +1,12 @@
-// PUMPFUN — meme-coin paper-trading engine (client-side).
+// PUMPFUN — meme-coin trading engine (client-side).
 //
 // Method: "buy cheap, sell expensive" on pump.fun memecoins. Unlike the pool
 // arbitrage bots (curve / binance) there is no cross-pair spread here — every
 // meme trades at ONE price on its bonding curve. The bot instead plays the
 // TIME game: it hunts dips and rides pumps, exactly like the seabot floor
 // engine. Each tick:
-//   1. Refresh USD prices for the watched meme universe (LIVE pump.fun API,
-//      with the deterministic mock engine as fallback for sandbox).
+//   1. Refresh the real pump.fun universe (LIVE API, v3 host) or the curated
+//      demo universe with the deterministic mock engine for sandbox.
 //   2. Score every coin as an OPPORTUNITY: cheapness vs. its drifted
 //      reference, short-term momentum, and age (new listings are hot).
 //   3. SELL open lots at take-profit / stop-loss / trailing-stop.
@@ -16,10 +16,32 @@
 // Capital is FICTIONAL (USD) in demo mode. In live mode the bot executes real
 // Jupiter swaps, which requires a connected Phantom wallet AND a real on-chain
 // mint for the coin — so only coins whose mint is a genuine base58 address are
-// tradable.
+// tradable. That is why live mode trades the API universe and never the demo
+// seeds: a fictional token cannot be swapped.
 
-export const PUMPFUN_API_BASE =
-  "https://frontend-api.pump.fun/coins?limit=40&offset=0&sort=created_timestamp&order=DESC&includeNsfw=false"
+/**
+ * pump.fun public API. The old `frontend-api.pump.fun` host now answers 530, so
+ * the live host is v3. v3 answers 403 to any request that carries an `Origin`
+ * header, which every browser fetch sends, so discovery is fetched through this
+ * app's own /api/pumpfun route (server-side, no Origin) instead of directly.
+ *
+ * Two discovery queries, because the newest listings are almost always dust:
+ *   - CORE: biggest caps on pump.fun. These are the graduated/liquid ones and
+ *     the only realistic trade universe.
+ *   - NEW: freshest listings, kept as a cheap "new listing" watchlist. They
+ *     only trade if Jupiter confirms a route with real depth.
+ * The API caps a page at ~70 rows, which is plenty for both.
+ */
+const PUMPFUN_API_PROXY = "/api/pumpfun"
+export const PUMPFUN_API_CORE = `${PUMPFUN_API_PROXY}?sort=market_cap&order=DESC&limit=100`
+export const PUMPFUN_API_NEW = `${PUMPFUN_API_PROXY}?sort=created_timestamp&order=DESC&limit=100`
+
+/** Coins below this USD market cap are dust and not worth a swap. */
+export const PUMPFUN_MIN_MCAP_USD = 25_000
+/** Fresh listings get a lower cap floor; the liquidity check does the rest. */
+export const PUMPFUN_MIN_MCAP_NEW_USD = 2_000
+/** Coins with less real USD liquidity have no usable exit. */
+export const PUMPFUN_MIN_LIQUIDITY_USD = 4_000
 
 /** Wrapped SOL mint — the funding side of every real swap. */
 export const WSOL_MINT = "So11111111111111111111111111111111111111112"
@@ -37,6 +59,131 @@ export function usdToBaseUnits(usd: number, priceUsd: number, decimals: number):
   if (!(priceUsd > 0)) return 0
   return Math.floor((usd / priceUsd) * Math.pow(10, decimals))
 }
+
+/** One coin as returned by the pump.fun API. */
+export interface PumpApiCoin {
+  mint: string
+  name: string
+  symbol: string
+  decimals: number
+  priceUsd: number
+  mcapUsd: number
+  createdAt: number
+  /** Real SOL left in the bonding curve — the exit liquidity. */
+  curveSol: number
+  complete: boolean
+  tokenProgram: string
+}
+
+/**
+ * Normalize the raw API payload into tradeable coins. Rows without a valid
+ * mint, banned/NSFW, under the market-cap floor or with an empty bonding curve
+ * are dropped because they cannot be bought and sold through Jupiter
+ * profitably. The USD liquidity floor is applied later, from Jupiter.
+ */
+export function parsePumpApiCoins(
+  raw: unknown,
+  minMcapUsd = PUMPFUN_MIN_MCAP_USD
+): PumpApiCoin[] {
+  const arr = (Array.isArray(raw) ? raw : ((raw as { coins?: unknown[] })?.coins ?? [])) as Record<
+    string,
+    unknown
+  >[]
+  const out: PumpApiCoin[] = []
+  for (const c of arr) {
+    if (c.is_banned === true || c.nsfw === true) continue
+    const mint = String(c.mint ?? c.address ?? '')
+    if (!isValidMint(mint)) continue
+    const mcapUsd = Number(c.usd_market_cap ?? c.market_cap_usd ?? 0)
+    if (!isFinite(mcapUsd) || mcapUsd < minMcapUsd) continue
+    const decimals = Number(c.base_decimals ?? 6) || 6
+    const supply = Number(c.total_supply ?? 0) / Math.pow(10, decimals)
+    const priceUsd = supply > 0 ? mcapUsd / supply : 0
+    if (!isFinite(priceUsd) || priceUsd <= 0) continue
+    // A bonding curve with no SOL reserves cannot be routed through Jupiter, so
+    // it is dropped here. The USD liquidity floor is NOT applied on this number:
+    // the executable liquidity is taken from Jupiter (buildLiveCoins), because
+    // this one needs a live SOL price and the API's own reserve figure.
+    const curveSol = Number(c.real_sol_reserves ?? 0) / 1e9
+    if (!(curveSol > 0)) continue
+    out.push({
+      mint,
+      name: String(c.name ?? '').trim() || String(c.symbol ?? '').trim() || 'Pump coin',
+      symbol: String(c.symbol ?? '').trim() || `${mint.slice(0, 4)}…`,
+      decimals,
+      priceUsd,
+      mcapUsd,
+      createdAt: Number(c.created_timestamp ?? 0) || Date.now(),
+      curveSol,
+      complete: c.complete === true,
+      tokenProgram: String(c.token_program ?? ''),
+    })
+  }
+  return out
+}
+
+/** Fetch one discovery page. Throws on network/API failure. */
+export async function fetchPumpApiCoins(url: string, signal?: AbortSignal): Promise<unknown> {
+  const res = await fetch(url, { signal })
+  if (!res.ok) throw new Error(`pump.fun api ${res.status}`)
+  return res.json()
+}
+
+/** Executable token facts straight from Jupiter: the price we can actually sell at. */
+export interface JupiterTokenPrice {
+  mint: string
+  usdPrice: number
+  liquidityUsd: number
+  decimals: number
+  createdAt: number
+  priceChange24h: number
+}
+
+const JUP_PRICE_API = "https://lite-api.jup.ag/price/v3"
+const JUP_PRICE_BATCH = 50
+
+/**
+ * Batch prices + liquidity from Jupiter. The pump.fun bonding-curve price is
+ * theoretical: a thin token can quote fine there and still have no route, so
+ * trading decisions and the liquidity filter use Jupiter instead. Mints with no
+ * route are simply absent from the response, which is the exit test.
+ */
+export async function fetchJupiterTokenPrices(
+  mints: string[],
+  signal?: AbortSignal
+): Promise<Map<string, JupiterTokenPrice>> {
+  const out = new Map<string, JupiterTokenPrice>()
+  const unique = [...new Set(mints.filter(isValidMint))]
+  for (let i = 0; i < unique.length; i += JUP_PRICE_BATCH) {
+    const batch = unique.slice(i, i + JUP_PRICE_BATCH)
+    const res = await fetch(`${JUP_PRICE_API}?ids=${batch.join(',')}`, { signal })
+    if (!res.ok) throw new Error(`jupiter price ${res.status}`)
+    const body = (await res.json()) as Record<
+      string,
+      {
+        usdPrice?: string | number
+        liquidity?: number
+        decimals?: number
+        createdAt?: string
+        priceChange24h?: number
+      }
+    >
+    for (const [mint, p] of Object.entries(body ?? {})) {
+      const usdPrice = Number(p.usdPrice ?? 0)
+      if (!isFinite(usdPrice) || usdPrice <= 0) continue
+      out.set(mint, {
+        mint,
+        usdPrice,
+        liquidityUsd: Number(p.liquidity ?? 0) || 0,
+        decimals: Number(p.decimals ?? 6) || 6,
+        createdAt: p.createdAt ? Date.parse(p.createdAt) || Date.now() : Date.now(),
+        priceChange24h: Number(p.priceChange24h ?? 0) || 0,
+      })
+    }
+  }
+  return out
+}
+
 
 // ---- deterministic pseudo-random (same engine as the other bots) ----
 export function seededRandom(seed: string): number {

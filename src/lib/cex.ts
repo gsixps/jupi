@@ -189,31 +189,43 @@ export async function binanceLotSize(symbol: string): Promise<number> {
 }
 
 // ================= KRAKEN =================
-const KRAKEN_REST = "https://api.kraken.com"
-
+// Signed calls go through the local /api/kraken proxy: Kraken has no CORS.
 async function krakenSignedPost(path: string, params: Record<string, string | number>, cred: ExchangeCredentials): Promise<unknown> {
-  const nonce = Date.now() * 1000
-  const body = encodeQuery({ ...params, nonce })
-  const sha = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body))
-  const shaHex = await bytesToHex(sha)
-  const sigInput = `${path}${shaHex}`
-  const signature = await hmacHex(cred.apiSecret, sigInput, "SHA-512")
-  const res = await fetch(`${KRAKEN_REST}${path}`, {
-    method: "POST",
-    headers: {
-      "API-Key": cred.apiKey,
-      "API-Sign": signature,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body,
-  })
-  if (!res.ok) {
-    const t = await res.text()
-    throw new Error(`Kraken ${res.status}: ${t.slice(0, 240)}`)
+  // Kraken sends no Access-Control-Allow-Origin and answers the CORS preflight
+  // with 404, so a browser cannot sign and read a request itself. The keys go to
+  // this app's own /api/kraken route, which signs with Node crypto and forwards
+  // to Kraken. They are never stored on the server.
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), 20000)
+  let res: Response
+  try {
+    res = await fetch("/api/kraken", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, params, apiKey: cred.apiKey, apiSecret: cred.apiSecret }),
+      signal: ctrl.signal,
+    })
+  } catch (e) {
+    throw new Error(
+      (e as Error).name === "AbortError"
+        ? "Kraken no respondió en 20s (proxy local)"
+        : `no se pudo contactar el proxy local /api/kraken: ${(e as Error).message}`
+    )
+  } finally {
+    clearTimeout(timer)
   }
-  const j = (await res.json()) as { error: string[]; result?: unknown }
+  const text = await res.text()
+  let j: { error?: string[]; result?: unknown }
+  try {
+    j = JSON.parse(text) as { error?: string[]; result?: unknown }
+  } catch {
+    throw new Error(`Kraken ${res.status}: respuesta ilegible`)
+  }
   if (Array.isArray(j.error) && j.error.length > 0) {
     throw new Error(`Kraken error: ${j.error.join(", ")}`)
+  }
+  if (!res.ok) {
+    throw new Error(`Kraken ${res.status}: ${text.slice(0, 200)}`)
   }
   return j.result
 }

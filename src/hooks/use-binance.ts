@@ -801,8 +801,7 @@ export function useBinanceBot() {
 
   const updateConfig = useCallback((patch: Partial<BinanceConfig>) => {
     setState((s) => {
-      // Interest compounding is mandatory: the patch can never turn it off.
-      const next = { ...s.config, ...patch, compound: true }
+      const next = { ...s.config, ...patch }
       if (patch.capitalUsd !== undefined && !s.enabled) {
         return { ...s, config: next, cashUsd: patch.capitalUsd }
       }

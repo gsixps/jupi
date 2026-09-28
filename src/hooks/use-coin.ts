@@ -765,8 +765,7 @@ log(
           ;(next as Record<string, unknown>)[k] = (patch as Record<string, unknown>)[k]
         }
       }
-      // Interest compounding is mandatory: the patch can never turn it off.
-      return { ...s, ...next, compound: true }
+      return { ...s, ...next }
     })
   }, [])
 

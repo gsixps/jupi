@@ -696,7 +696,9 @@ const reason = e?.message ?? (e == null ? "unknown error" : typeof e === "object
           // the balance grows, each new trade is proportionally larger → gains
           // compound. e.g. $5 @ 25% = $1.25; after growing to $8 → $2.00; $12 →
           // $3.00; and so on. This is how the bot "uses the capital it has".
-          const tradeUsd = usdcBalance * (s0.config.tradeSizePct / 100)
+          // With compounding off it falls back to a fixed size on the funded capital.
+          const compoundBase = s0.config.compoundInterest ? usdcBalance : s0.config.capital
+          const tradeUsd = compoundBase * (s0.config.tradeSizePct / 100)
           if (tradeUsd < 0.15) {
             // rate-limit the spammy log (the loop retries every scan)
             if (Date.now() - (lastMinTradeLogRef.current ?? 0) > 30000) {

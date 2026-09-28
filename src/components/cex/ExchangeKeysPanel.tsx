@@ -87,18 +87,45 @@ export function ExchangeKeysPanel({
     setBusy(true)
     setStatus(null)
     const cred: ExchangeCredentials = { apiKey: k, apiSecret: s }
+    // Save first: a verification problem must never cost the user their keys.
+    saveCreds(kind, cred)
+    setHasCreds(true)
     try {
       const res = await verify(cred)
       setStatus(res)
       if (res.ok) {
-        saveCreds(kind, cred)
-        setHasCreds(true)
         setApiKey('')
         setApiSecret('')
         onLog?.(`${meta.name}: claves guardadas y verificadas.`)
       } else {
-        onLog?.(`${meta.name}: ${res.label}`, 'error')
+        // Keys are already stored, so the user can fix them without retyping.
+        onLog?.(`${meta.name}: claves guardadas, pero la verificación falló — ${res.label}`, 'error')
       }
+    } catch (e) {
+      const msg = (e as Error).message
+      setStatus({ ok: false, label: `Claves guardadas. No se pudo verificar: ${msg.slice(0, 140)}` })
+      onLog?.(`${meta.name}: claves guardadas, verificación fallida — ${msg}`, 'error')
+    } finally {
+      setBusy(false)
+    }
+  }, [apiKey, apiSecret, kind, onLog, verify, meta.name])
+
+  /** Re-check the stored keys without retyping them. */
+  const handleVerify = useCallback(async () => {
+    const cred = loadCreds(kind)
+    if (!cred) {
+      setStatus({ ok: false, label: 'No hay claves guardadas.' })
+      return
+    }
+    setBusy(true)
+    setStatus(null)
+    try {
+      const res = await verify(cred)
+      setStatus(res)
+      onLog?.(
+        res.ok ? `${meta.name}: ${res.label}` : `${meta.name}: ${res.label}`,
+        res.ok ? 'info' : 'error'
+      )
     } catch (e) {
       const msg = (e as Error).message
       setStatus({ ok: false, label: msg.slice(0, 160) })
@@ -106,7 +133,7 @@ export function ExchangeKeysPanel({
     } finally {
       setBusy(false)
     }
-  }, [apiKey, apiSecret, kind, onLog, verify, meta.name])
+  }, [kind, onLog, verify, meta.name])
 
   const handleClear = useCallback(() => {
     clearCreds(kind)
@@ -137,6 +164,10 @@ export function ExchangeKeysPanel({
 
       {hasCreds ? (
         <div className="flex flex-wrap items-center gap-2">
+          <Button size="sm" variant="outline" onClick={handleVerify} disabled={busy}>
+            {busy ? <Loader2 className="size-3.5 animate-spin" /> : <ShieldCheck className="size-3.5" />}
+            {busy ? 'Verificando…' : 'Verificar claves'}
+          </Button>
           <Button size="sm" variant="outline" onClick={handleClear} disabled={busy}>
             <Trash2 className="size-3.5" /> Borrar claves
           </Button>
@@ -174,8 +205,7 @@ export function ExchangeKeysPanel({
             <Button size="sm" onClick={handleSave} disabled={busy}>
               {busy ? <Loader2 className="size-3.5 animate-spin" /> : <PlugZap className="size-3.5" />}
               {busy ? 'Verificando…' : 'Guardar y verificar'}
-            </Button>
-            <label className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+            </Button>            <label className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
               <input
                 type="checkbox"
                 checked={showSecret}
@@ -203,6 +233,12 @@ export function ExchangeKeysPanel({
           {status.label}
         </p>
       )}
+
+      <p className="text-[10px] text-muted-foreground">
+        {kind === 'kraken'
+          ? 'Kraken no permite CORS: las peticiones firmadas salen por el proxy local /api/kraken de esta misma máquina (Next.js). Las claves no se guardan en el servidor.'
+          : 'Las claves se firman desde este navegador y solo se guardan aquí (localStorage).'}
+      </p>
 
       <Separator />
 

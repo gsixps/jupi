@@ -393,8 +393,10 @@ export function usePaperTrading() {
           })
           if (signal.action !== "BUY") continue
           if (stateRef.current.positions.length >= s0.config.maxPositions) continue
-          // COMPOUND: trade size = % of CURRENT balance
-          const tradeUsd = balance * (s0.config.tradeSizePct / 100)
+          // COMPOUND: trade size = % of the CURRENT balance when compounding is
+          // on, otherwise % of the original capital (fixed size).
+          const compoundBase = s0.config.compoundInterest ? balance : s0.config.capital
+          const tradeUsd = compoundBase * (s0.config.tradeSizePct / 100)
           if (tradeUsd < 1) continue
           // PAPER BUY at REAL Jupiter quote
           const q = await getQuote(USDC_MINT, mint, tradeUsd, s0.config.slippageBps, tokens, tickPrices)

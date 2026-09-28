@@ -444,13 +444,12 @@ export function SeabotTradingPanel({ seabot }: SeabotTradingPanelProps) {
                   Reinvest profits: per-trade budget scales with equity
                   {seabot.stats?.compound && seabot.stats.compoundFactor > 0
                     ? ` (×${seabot.stats.compoundFactor.toFixed(2)})`
-                    : ''}
+                    : ' (fixed budget)'}
                 </p>
               </div>
               <Switch
-        checked
-        disabled
-        title="Interest compounding is always on"
+                checked={seabot.config.compound}
+                onCheckedChange={(v) => seabot.updateConfig({ compound: v })}
               />
             </div>
           </div>

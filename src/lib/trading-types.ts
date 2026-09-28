@@ -104,6 +104,12 @@ export interface BotConfig {
   capital: number
   maxPositions: number
   tradeSizePct: number
+  /**
+   * Interest compounding. When on, the per-trade size follows the CURRENT
+   * balance, so profits are reinvested. When off, the size follows the
+   * original capital. On by default.
+   */
+  compoundInterest: boolean
   buyThreshold: number
   sellThreshold: number
   stopLossPct: number
@@ -120,6 +126,7 @@ export const DEFAULT_CONFIG: BotConfig = {
   capital: 1000,
   maxPositions: 6,
   tradeSizePct: 12,
+  compoundInterest: true,
   buyThreshold: 0.7, // buy when price is 0.7% below SMA (oversold)
   sellThreshold: 1.0, // sell when 1% above entry (take profit)
   stopLossPct: 2.5, // cut loss at -2.5%

@@ -322,6 +322,29 @@ export function KrakenTradingPanel({ kraken }: KrakenTradingPanelProps) {
           </Button>
         </div>
 
+        {/* Real-mode API connection — right under the controls, always visible */}
+        <ExchangeKeysPanel
+          kind="kraken"
+          verify={verifyKrakenKeys}
+          liveEnabled={kraken.config.liveTrading}
+          onLiveEnabledChange={(v) => kraken.updateConfig({ liveTrading: v })}
+          running={running}
+          onLog={kraken.log}
+        />
+
+        {kraken.halted && (
+          <div className="rounded-md border border-rose-500/40 bg-rose-500/10 p-2.5">
+            <p className="text-xs font-semibold text-rose-300">
+              Bot detenido por seguridad
+            </p>
+            <p className="text-[11px] text-rose-200/80">{kraken.haltReason}</p>
+            <p className="text-[10px] text-muted-foreground">
+              No se simuló ninguna orden. Revisa el saldo y las claves, y vuelve a
+              pulsar Start.
+            </p>
+          </div>
+        )}
+
         {/* Capital input (only editable when stopped) */}
         <div className="flex flex-wrap items-end gap-2 rounded-md border border-dashed border-border/60 p-2.5">
           <div className="space-y-1">
@@ -451,42 +474,18 @@ export function KrakenTradingPanel({ kraken }: KrakenTradingPanelProps) {
                   Reinvest profits: per-trade budget scales with equity
                   {stats?.compound && stats.compoundFactor > 0
                     ? ` (×${stats.compoundFactor.toFixed(2)})`
-                    : ''}
+                    : ' (fixed budget)'}
                 </p>
               </div>
               <Switch
-        checked
-        disabled
-        title="Interest compounding is always on"
+                checked={kraken.config.compound}
+                onCheckedChange={(v) => kraken.updateConfig({ compound: v })}
               />
             </div>
           </div>
         </div>
 
         <Separator />
-
-        {/* Real-mode connection */}
-        <ExchangeKeysPanel
-          kind="kraken"
-          verify={verifyKrakenKeys}
-          liveEnabled={kraken.config.liveTrading}
-          onLiveEnabledChange={(v) => kraken.updateConfig({ liveTrading: v })}
-          running={running}
-          onLog={kraken.log}
-        />
-
-        {kraken.halted && (
-          <div className="rounded-md border border-rose-500/40 bg-rose-500/10 p-2.5">
-            <p className="text-xs font-semibold text-rose-300">
-              Bot detenido por seguridad
-            </p>
-            <p className="text-[11px] text-rose-200/80">{kraken.haltReason}</p>
-            <p className="text-[10px] text-muted-foreground">
-              No se simuló ninguna orden. Revisa el saldo y las claves, y vuelve a
-              pulsar Start.
-            </p>
-          </div>
-        )}
 
         {/* Open arbs */}
         <div className="space-y-2">

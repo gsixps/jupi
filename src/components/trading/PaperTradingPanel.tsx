@@ -32,6 +32,7 @@ import { Slider } from '@/components/ui/slider'
 import { Label } from '@/components/ui/label'
 import { Input } from '@/components/ui/input'
 import { Separator } from '@/components/ui/separator'
+import { Switch } from '@/components/ui/switch'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -243,8 +244,11 @@ export function PaperTradingPanel({ paper }: PaperTradingPanelProps) {
   const pnlTone = totalPnl >= 0 ? 'positive' : 'negative'
 
   const running = paper.enabled
-  // Next-trade size = tradeSizePct% of CURRENT (fictional) USDC balance — compound.
-  const nextTradeUsd = paper.balance * (paper.config.tradeSizePct / 100)
+  // Next-trade size = tradeSizePct% of the CURRENT (fictional) USDC balance when
+  // compounding is on, or of the original capital when it is off.
+  const compoundOn = paper.config.compoundInterest
+  const compoundBase = compoundOn ? paper.balance : paper.config.capital
+  const nextTradeUsd = compoundBase * (paper.config.tradeSizePct / 100)
 
   const handleStart = () => {
     setConfirmedThisSession(true)
@@ -397,7 +401,7 @@ export function PaperTradingPanel({ paper }: PaperTradingPanelProps) {
           <StatTile
             label="Next Trade Size"
             value={fmtUsd(nextTradeUsd)}
-            sub={`${paper.config.tradeSizePct}% of $${paper.balance.toFixed(2)}`}
+            sub={`${paper.config.tradeSizePct}% of $${(compoundOn ? paper.balance : paper.config.capital).toFixed(2)}${compoundOn ? ' (crece)' : ' (fijo)'}`}
             tone="positive"
           />
           <StatTile
@@ -451,7 +455,7 @@ export function PaperTradingPanel({ paper }: PaperTradingPanelProps) {
               const val = paper.config[c.key] as number
               const maxTradeUsd =
                 c.key === 'tradeSizePct'
-                  ? (val / 100) * paper.balance
+                  ? (val / 100) * compoundBase
                   : 0
               return (
                 <div key={c.key} className="space-y-1.5">
@@ -479,9 +483,24 @@ export function PaperTradingPanel({ paper }: PaperTradingPanelProps) {
                     disabled={running}
                   />
                   {c.key === 'tradeSizePct' && (
-                    <p className="text-[10px] text-emerald-400/80">
-                      ↗ Scales with current balance — bigger trades as you profit.
-                    </p>
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between gap-2 rounded-md border border-dashed border-border/60 px-2 py-1.5">
+                        <div className="space-y-0.5">
+                          <Label className="text-[11px]">Compound interest</Label>
+                          <p className="text-[10px] text-muted-foreground">
+                            {compoundOn
+                              ? '↗ Reinvests profits: bigger trades as equity grows.'
+                              : '→ Fixed size from the starting capital.'}
+                          </p>
+                        </div>
+                        <Switch
+                          checked={compoundOn}
+                          onCheckedChange={(v) =>
+                            paper.updateConfig({ compoundInterest: v })
+                          }
+                        />
+                      </div>
+                    </div>
                   )}
                   {running && c.key !== 'tradeSizePct' && (
                     <p className="text-[10px] text-muted-foreground">
