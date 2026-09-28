@@ -61,6 +61,11 @@ const LIVE_MAX_DAILY_LOSS_USD = 5
 const LIVE_MAX_CONSECUTIVE_LOSSES = 3
 const LIVE_COOLDOWN_MS = 60_000
 
+// Hard safety gate: the current repository does NOT yet implement an atomic
+// three-leg Kraken execution with rollback/reconciliation for every leg.
+// Keep LIVE triangular execution disabled until that engine is validated.
+const LIVE_TRIANGLE_EXECUTION_ENABLED = false
+
 export interface KrakenConfig {
   capitalUsd: number
   budgetPerTradeUsd: number
@@ -397,6 +402,12 @@ export function useKrakenBot() {
       let cred: ExchangeCredentials | null = null
       let realTrades = 0
       if (cfg.liveTrading) {
+        if (!LIVE_TRIANGLE_EXECUTION_ENABLED) {
+          halt(
+            'LIVE bloqueado: el motor actual detecta divergencia triangular pero no ejecuta/reconcilia de forma segura las 3 patas. Usa paper hasta instalar y validar el ejecutor 3-leg.'
+          )
+          return
+        }
         cred = loadCreds('kraken')
         if (!cred || !cred.apiKey || !cred.apiSecret) {
           halt('faltan credenciales de Kraken (API key + secret)')
@@ -621,7 +632,7 @@ export function useKrakenBot() {
         }
       }
 
-      // 3. BUY logic — detect divergences ≥ minSpreadBps
+      // 3. BUY logic — paper strategy. LIVE is hard-gated until the 3-leg executor is validated.
       const openBefore = holdings.filter((h) => h.status === 'open')
       const investedBefore = openBefore.reduce((a, h) => a + h.notionalUsd, 0)
       const equityBefore = cash + investedBefore
