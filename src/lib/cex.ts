@@ -273,16 +273,22 @@ export async function krakenOrderFilters(pair: string): Promise<KrakenOrderFilte
       error: string[]
       result?: Record<
         string,
-        { costmin?: number; ordermin?: number; pair_decimals?: number }
+        { costmin?: number; ordermin?: number; pair_decimals?: number; lot_decimals?: number }
       >
     }
     if (Array.isArray(j.error) && j.error.length > 0) return fallback
     const first = j.result ? Object.values(j.result)[0] : undefined
     if (!first) return fallback
+    // `lot_decimals` is the VOLUME precision (`pair_decimals` is the price one).
+    // XXBTZUSD reports 1 vs 8: using the price value would round every BTC order
+    // down to zero and silently skip the route.
+    const volumeDecimals = Number(first.lot_decimals ?? first.pair_decimals)
     return {
       costmin: Number(first.costmin ?? 0) || 0,
       ordermin: Number(first.ordermin ?? 0) || 0,
-      lot: first.pair_decimals != null ? Math.pow(10, -first.pair_decimals) : fallback.lot,
+      lot: isFinite(volumeDecimals) && volumeDecimals > 0
+        ? Math.pow(10, -volumeDecimals)
+        : fallback.lot,
     }
   } catch {
     return fallback
@@ -696,6 +702,50 @@ export async function verifyBinanceKeys(cred: ExchangeCredentials): Promise<{ ok
   }
 }
 
+/**
+ * Kraken's error codes are cryptic and each one has a different fix. `EAPI:
+ * Invalid key` in particular does NOT mean the signature is wrong: Kraken
+ * authenticates the key FIRST, so this only ever means the key string it
+ * received is not one it knows.
+ */
+export function krakenErrorHint(code: string): string {
+  const c = code.trim()
+  if (/^EAPI:Invalid key$/i.test(c)) {
+    return 'Kraken no reconoce esa API Key (la firma ni se comprueba: primero valida la clave). Revisa que hayas pegado la Key —no el Secret— del MISMO par de claves, sin espacios ni comillas, y que la clave no esté revocada. Kraken solo muestra el Secret una vez, al crearla.'
+  }
+  if (/^EAPI:Invalid signature$/i.test(c)) {
+    return 'La Key es válida pero la firma no cuadra: el Secret no corresponde a esa Key, o se pegó con caracteres de más.'
+  }
+  if (/^EAPI:Invalid nonce$/i.test(c)) {
+    return 'Nonce duplicado o fuera de rango. Vuelve a verificar en unos segundos.'
+  }
+  if (/^EAPI:Feature disabled$/i.test(c)) {
+    return 'Esa clave no tiene permiso para esta operación. En Kraken, edita la clave y activa Query Funds (y Trade para operar).'
+  }
+  if (/^EAPI:Rate limit exceeded$/i.test(c)) {
+    return 'Demasiadas peticiones a la API de Kraken. Espera unos segundos y reintenta.'
+  }
+  if (/^ESession:/i.test(c)) {
+    return 'Kraken cerró la sesión de la clave. Revisa que la clave siga activa.'
+  }
+  if (/^EOrder:Insufficient funds$/i.test(c)) {
+    return 'Saldo insuficiente en Kraken para esa moneda.'
+  }
+  if (/^EOrder:Insufficient funds or margin/i.test(c)) {
+    return 'Saldo o margen insuficiente en Kraken.'
+  }
+  if (/^EOrder:Invalid volume$/i.test(c)) {
+    return 'Kraken rechazó el volumen: por debajo del mínimo del par o con más decimales de los permitidos.'
+  }
+  if (/^EGeneral:Invalid arguments$/i.test(c)) {
+    return 'Kraken rechazó los parámetros de la orden (volumen o par).'
+  }
+  if (/^EAPI:Invalid arguments$/i.test(c)) {
+    return 'Kraken rechazó los parámetros enviados por el proxy.'
+  }
+  return ''
+}
+
 export async function verifyKrakenKeys(cred: ExchangeCredentials): Promise<{ ok: boolean; label: string }> {
   try {
     const bals = await krakenGetBalances(cred)
@@ -705,7 +755,13 @@ export async function verifyKrakenKeys(cred: ExchangeCredentials): Promise<{ ok:
       label: `Claves válidas · USD libre ${usd ? usd.free.toFixed(2) : "0.00"}`,
     }
   } catch (e) {
-    return { ok: false, label: `Claves inválidas: ${(e as Error).message.slice(0, 140)}` }
+    const raw = (e as Error).message
+    const code = raw.match(/Kraken error: (.*)$/)?.[1] ?? ""
+    const hint = krakenErrorHint(code)
+    return {
+      ok: false,
+      label: hint ? `Claves rechazadas: ${code} — ${hint}` : `Claves inválidas: ${raw.slice(0, 160)}`,
+    }
   }
 }
 

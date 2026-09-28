@@ -23,6 +23,66 @@ import {
 
 export type { ExchangeKind }
 
+/**
+ * A key copied from a web page drags invisible characters along (NBSP, zero
+ * width, BOM) and sometimes the quotes around it. Kraken authenticates the key
+ * string before it ever looks at the signature, so a single invisible character
+ * is enough to get `EAPI:Invalid key` back.
+ */
+function cleanPaste(v: string): string {
+  return v
+    .replace(/[\u00a0\u200b-\u200d\u2060\ufeff]/g, '')
+    .replace(/^[\s"']+|[\s"']+$/g, '')
+}
+
+/**
+ * People routinely paste the whole thing into the first box as `key: secret`,
+ * `key secret` or on two lines. Recover both values instead of sending a
+ * malformed key.
+ */
+function splitPastedPair(keyRaw: string, secretRaw: string): { key: string; secret: string } {
+  const invisibleStripped = secretRaw.replace(/[\u00a0\u200b-\u200d\u2060\ufeff]/g, '')
+  const key = cleanPaste(keyRaw)
+  if (cleanPaste(secretRaw)) return { key, secret: cleanPaste(secretRaw) }
+  const parts = keyRaw
+    .replace(/[\u00a0\u200b-\u200d\u2060\ufeff]/g, '')
+    .split(/[:\r\n\t]+|\s{2,}/)
+    .map(cleanPaste)
+    .filter(Boolean)
+  if (parts.length >= 2) return { key: parts[0], secret: parts[1] }
+  return { key, secret: cleanPaste(invisibleStripped) }
+}
+
+/** Shape check per exchange, so a swapped key/secret is caught before sending. */
+function keyShapeError(kind: ExchangeKind, key: string, secret: string): string | null {
+  if (!key) return 'Falta la API key.'
+  if (!secret) return 'Falta el API secret.'
+  if (kind === 'kraken') {
+    // Kraken keys/secrets are ~88 base64 chars. A pasted private key looks the
+    // same, so the only reliable defence is the length + alphabet.
+    if (!/^[A-Za-z0-9+/=_-]{60,140}$/.test(key)) {
+      return 'La key pegada no tiene forma de API key de Kraken (60-140 caracteres base64). ¿Pegaste la Key en lugar del Secret, o le quedó un salto de línea dentro?'
+    }
+    if (!/^[A-Za-z0-9+/=_-]{40,140}$/.test(secret)) {
+      return 'El secret pegado no tiene forma de API secret de Kraken (40-140 caracteres base64).'
+    }
+  } else {
+    if (!/^[A-Za-z0-9]{20,120}$/.test(key)) {
+      return 'La API key de Binance no tiene el formato esperado (solo letras y números).'
+    }
+    if (!/^[A-Za-z0-9]{20,120}$/.test(secret)) {
+      return 'El API secret de Binance no tiene el formato esperado (solo letras y números).'
+    }
+  }
+  return null
+}
+
+/** Masked preview, so the user can confirm what is stored without exposing it. */
+function maskKey(v: string): string {
+  if (v.length <= 8) return `${v.slice(0, 2)}… (${v.length} car.)`
+  return `${v.slice(0, 4)}…${v.slice(-4)} (${v.length} car.)`
+}
+
 interface ExchangeKeysPanelProps {
   kind: ExchangeKind
   /** Verify the keys against the exchange and return a human label. */
@@ -78,10 +138,10 @@ export function ExchangeKeysPanel({
   }, [kind])
 
   const handleSave = useCallback(async () => {
-    const k = apiKey.trim()
-    const s = apiSecret.trim()
-    if (!k || !s) {
-      setStatus({ ok: false, label: 'Introduce API key y secret.' })
+    const { key: k, secret: s } = splitPastedPair(apiKey, apiSecret)
+    const shapeError = keyShapeError(kind, k, s)
+    if (shapeError) {
+      setStatus({ ok: false, label: shapeError })
       return
     }
     setBusy(true)
@@ -99,6 +159,7 @@ export function ExchangeKeysPanel({
         onLog?.(`${meta.name}: claves guardadas y verificadas.`)
       } else {
         // Keys are already stored, so the user can fix them without retyping.
+        setStatus({ ok: false, label: `Guardadas, pero Kraken/Binance las rechazó. Enviado: ${maskKey(k)} — ${res.label}` })
         onLog?.(`${meta.name}: claves guardadas, pero la verificación falló — ${res.label}`, 'error')
       }
     } catch (e) {
