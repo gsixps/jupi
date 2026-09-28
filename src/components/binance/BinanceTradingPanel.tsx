@@ -484,6 +484,22 @@ export function BinanceTradingPanel({ binance }: BinanceTradingPanelProps) {
               No se simuló ninguna orden. Revisa el saldo y las claves, y vuelve a
               pulsar Start.
             </p>
+            {/saldo real|posici[oó]n/i.test(binance.haltReason ?? '') && (
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 gap-1.5 text-[11px]"
+                  onClick={() => void binance.syncWithExchange()}
+                >
+                  <RefreshCw className="size-3" /> Sincronizar con el exchange
+                </Button>
+                <span className="text-[10px] text-muted-foreground">
+                  Adopta el saldo real de Binance y cierra lo que ya no exista. No
+                  coloca órdenes.
+                </span>
+              </div>
+            )}
           </div>
         )}
 

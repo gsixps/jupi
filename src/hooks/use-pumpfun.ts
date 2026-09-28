@@ -42,10 +42,19 @@ import type {
 } from '@/lib/pumpfun'
 import type { EquityPoint } from '@/lib/trading-types'
 import { executeRealSwap, fetchRealQuote } from '@/lib/jupiter-swap'
+import { getTokenBalance } from '@/lib/trading-wallet'
+import {
+  clearLiveSnapshot,
+  loadLiveSnapshot,
+  reconcileLiveState,
+  saveLiveSnapshot,
+} from '@/lib/live-state'
 import { LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js'
 import type { TokenInfo } from '@/lib/trading-types'
 import { realTokenPriceUsd } from '@/lib/cex'
 import type { UseWallet } from '@/hooks/use-wallet'
+
+const LIVE_BOT = 'pumpfun'
 
 /** Slippage tolerance for the real Jupiter swaps (0.5%). */
 const SLIPPAGE_BPS = 50
@@ -280,16 +289,27 @@ export function usePumpFunBot(wallet?: UseWallet) {
       }
       priceHistory[c.id] = h
     }
+    // LIVE positions survive a refresh: without this the bot forgets the mints
+    // it holds in the wallet and buys the same coin twice.
+    const snap = loadLiveSnapshot<PumpHolding>(LIVE_BOT)
     return {
       enabled: false,
       config: { ...DEFAULT_PUMPFUN_CONFIG },
-      cashUsd: DEFAULT_PUMPFUN_CONFIG.capitalUsd,
+      cashUsd: snap?.cashUsd ?? DEFAULT_PUMPFUN_CONFIG.capitalUsd,
       coins,
-      holdings: [],
+      holdings: snap?.open ?? [],
       trades: [],
       stats: null,
       equityCurve: [],
-      logs: [],
+      logs: snap
+        ? [
+            {
+              time: Date.now(),
+              msg: `Sesión live restaurada: ${snap.open.length} posición(es) abierta(s) desde ${new Date(snap.savedAt).toLocaleString()}. Se verificará contra la wallet al arrancar.`,
+              level: 'info',
+            },
+          ]
+        : [],
       status: 'idle',
       priceHistory,
       opps: [],
@@ -359,6 +379,8 @@ export function usePumpFunBot(wallet?: UseWallet) {
       // that sizes every swap and prices the curve liquidity. All of it has to
       // be known before any coin is considered.
       let solUsd = 0
+      /** Open positions confirmed against the chain this tick (live only). */
+      let reconciled: PumpHolding[] = []
       if (cfg.liveTrading) {
         if (!wallet || !wallet.connected || !wallet.publicKey) {
           halt('modo live sin wallet Phantom conectada')
@@ -394,6 +416,43 @@ export function usePumpFunBot(wallet?: UseWallet) {
         if (!(solUsd > 0)) {
           halt('no se pudo obtener el precio de SOL en USD; no se pueden dimensionar swaps')
           return
+        }
+
+        // The chain decides the quantities. A refresh, a manual swap from
+        // another tab or a partial fill all show up here.
+        const openNow = stateRef.current.holdings.filter((h) => h.status === 'open' && h.mint)
+        if (openNow.length > 0) {
+          const balances = new Map<string, number>()
+          for (const h of openNow) {
+            balances.set(
+              h.mint as string,
+              await getTokenBalance(connection, wallet.publicKey, h.mint as string, h.decimals ?? 6)
+            )
+          }
+          const rec = reconcileLiveState<PumpHolding>({
+            bot: LIVE_BOT,
+            persisted: openNow,
+            balances,
+            minQty: 0.000000001,
+            view: (h) => ({
+              liveAsset: h.mint ?? '',
+              liveQty: h.qty,
+              liveLabel: `${h.symbol} (${h.name})`,
+            }),
+            withQty: (h, qty) => ({ ...h, qty }),
+          })
+          for (const n of rec.notes) log(`PumpFun: ${n}`, 'info')
+          if (rec.fatal) {
+            halt(rec.fatal)
+            return
+          }
+          if (rec.missing.length > 0) {
+            log(
+              `PumpFun: ${rec.missing.length} posición(es) ya no están en la wallet y se marcan como cerradas`,
+              'warn'
+            )
+          }
+          reconciled = rec.holdings
         }
       }
 
@@ -573,7 +632,31 @@ export function usePumpFunBot(wallet?: UseWallet) {
       // 3. SELL open lots ("sell expensive")
       const priceByCoin = new Map(scored.map((c) => [c.id, c.priceUsd]))
       let cash = stateRef.current.cashUsd
-      const holdings = stateRef.current.holdings.map((h) => ({ ...h }))
+      let holdings = stateRef.current.holdings.map((h) => ({ ...h }))
+      if (reconciled.length > 0) {
+        const gone = new Set(
+          stateRef.current.holdings
+            .filter((h) => h.status === 'open' && h.mint && !reconciled.some((r) => r.id === h.id))
+            .map((h) => h.id)
+        )
+        holdings = [
+          ...reconciled,
+          ...holdings
+            .filter((h) => h.status === 'open' && !h.mint)
+            .map((h) => ({ ...h }))
+            .concat(
+              stateRef.current.holdings
+                .filter((h) => gone.has(h.id))
+                .map((h) => ({
+                  ...h,
+                  status: 'sold' as const,
+                  soldAt: now,
+                  sellPriceUsd: h.currentPriceUsd,
+                  pnlUsd: 0,
+                }))
+            ),
+        ]
+      }
       const trades = [...stateRef.current.trades]
       let executedOpp: PumpOpportunity | null = null
 
@@ -996,6 +1079,15 @@ export function usePumpFunBot(wallet?: UseWallet) {
         dataSource: liveData ? 'live' : 'mock',
       }))
 
+      // Persist only what a refresh must not lose: the open live positions.
+      if (cfg.liveTrading) {
+        saveLiveSnapshot(
+          LIVE_BOT,
+          holdings.filter((h) => h.status === 'open'),
+          { cashUsd: cash, wasRunning: true }
+        )
+      }
+
       if (buys === 0 && opps.length === 0) {
         log(
           `Sin oportunidades â‰¥ score ${cfg.minScore} este ciclo â€” ${scored.length} memes rastreados`,
@@ -1068,6 +1160,7 @@ export function usePumpFunBot(wallet?: UseWallet) {
       logs: [],
       opps: [],
     }))
+    clearLiveSnapshot(LIVE_BOT)
     if (loopRef.current) {
       clearInterval(loopRef.current)
       loopRef.current = null

@@ -495,3 +495,35 @@ export async function getTradingWalletBalances(
   }
   return { sol, usdc, solLamports: lamports, usdcBase }
 }
+
+/**
+ * Real SPL balance of one mint in the trading wallet, in token units.
+ *
+ * This is the chain-side source of truth for a PumpFun position: a refresh, a
+ * manual sell from another tab or a swap that only partially filled all show up
+ * here as a quantity that differs from what the bot recorded. Missing token
+ * account simply means 0.
+ */
+export async function getTokenBalance(
+  connection: Connection,
+  ownerPubkey: string,
+  mint: string,
+  decimals: number
+): Promise<number> {
+  try {
+    const owner = new PublicKey(ownerPubkey)
+    const mintPk = new PublicKey(mint)
+    const ata = await getAssociatedTokenAddress(
+      mintPk,
+      owner,
+      false,
+      TOKEN_PROGRAM_ID,
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    )
+    const acct = await getAccount(connection, ata).catch(() => null)
+    if (!acct) return 0
+    return Number(acct.amount) / Math.pow(10, decimals || 6)
+  } catch {
+    return 0
+  }
+}

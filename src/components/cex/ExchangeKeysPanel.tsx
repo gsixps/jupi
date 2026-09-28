@@ -53,28 +53,39 @@ function splitPastedPair(keyRaw: string, secretRaw: string): { key: string; secr
   return { key, secret: cleanPaste(invisibleStripped) }
 }
 
-/** Shape check per exchange, so a swapped key/secret is caught before sending. */
-function keyShapeError(kind: ExchangeKind, key: string, secret: string): string | null {
-  if (!key) return 'Falta la API key.'
+/**
+ * Describe what was actually pasted, so a rejected key can be diagnosed without
+ * ever asking the user to paste a secret into a chat.
+ *
+ * This NEVER blocks the attempt: the exchange is the only authority on whether a
+ * key is valid. A guessed format rule once locked people out of their own
+ * account, so this only reports.
+ */
+function describePaste(kind: ExchangeKind, key: string, secret: string): string {
+  if (!key) return 'No se recibió ninguna API key.'
   if (!secret) return 'Falta el API secret.'
-  if (kind === 'kraken') {
-    // Kraken keys/secrets are ~88 base64 chars. A pasted private key looks the
-    // same, so the only reliable defence is the length + alphabet.
-    if (!/^[A-Za-z0-9+/=_-]{60,140}$/.test(key)) {
-      return 'La key pegada no tiene forma de API key de Kraken (60-140 caracteres base64). ¿Pegaste la Key en lugar del Secret, o le quedó un salto de línea dentro?'
-    }
-    if (!/^[A-Za-z0-9+/=_-]{40,140}$/.test(secret)) {
-      return 'El secret pegado no tiene forma de API secret de Kraken (40-140 caracteres base64).'
-    }
-  } else {
-    if (!/^[A-Za-z0-9]{20,120}$/.test(key)) {
-      return 'La API key de Binance no tiene el formato esperado (solo letras y números).'
-    }
-    if (!/^[A-Za-z0-9]{20,120}$/.test(secret)) {
-      return 'El API secret de Binance no tiene el formato esperado (solo letras y números).'
-    }
+  const notes: string[] = [`key ${maskKey(key)}`]
+  const isBinance = (s: string) => s.length === 64 && /^[0-9a-f]+$/.test(s)
+  const isKraken = (s: string) =>
+    s.length >= 84 && s.length <= 88 && /^[A-Za-z0-9+/=]+$/.test(s) && (/[A-Z]/.test(s) || /[+/=]/.test(s))
+  if (isBinance(key) && isBinance(secret)) {
+    notes.push(
+      kind === 'kraken'
+        ? 'formato de 64 hexadecimales = BINANCE, no Kraken'
+        : 'formato hexadecimal, el habitual de Binance'
+    )
+  } else if (isKraken(key) && isKraken(secret)) {
+    notes.push('formato base64 largo, coherente con Kraken')
   }
-  return null
+  if (key.length < 40) {
+    notes.push(
+      'la key es demasiado corta: la de Kraken suele tener 84-88 caracteres y la de Binance 64'
+    )
+  }
+  if (!/^[A-Za-z0-9+/=_-]+$/.test(key)) {
+    notes.push('la key contiene caracteres que no son de una API key (espacios, comas, dos puntos)')
+  }
+  return notes.join(' · ')
 }
 
 /** Masked preview, so the user can confirm what is stored without exposing it. */
@@ -139,9 +150,8 @@ export function ExchangeKeysPanel({
 
   const handleSave = useCallback(async () => {
     const { key: k, secret: s } = splitPastedPair(apiKey, apiSecret)
-    const shapeError = keyShapeError(kind, k, s)
-    if (shapeError) {
-      setStatus({ ok: false, label: shapeError })
+    if (!k || !s) {
+      setStatus({ ok: false, label: 'Introduce la API key y el API secret.' })
       return
     }
     setBusy(true)
@@ -159,12 +169,18 @@ export function ExchangeKeysPanel({
         onLog?.(`${meta.name}: claves guardadas y verificadas.`)
       } else {
         // Keys are already stored, so the user can fix them without retyping.
-        setStatus({ ok: false, label: `Guardadas, pero Kraken/Binance las rechazó. Enviado: ${maskKey(k)} — ${res.label}` })
+        setStatus({
+          ok: false,
+          label: `Guardadas, pero ${meta.name} las rechazó. ${res.label} — Lo enviado: ${describePaste(kind, k, s)}`,
+        })
         onLog?.(`${meta.name}: claves guardadas, pero la verificación falló — ${res.label}`, 'error')
       }
     } catch (e) {
       const msg = (e as Error).message
-      setStatus({ ok: false, label: `Claves guardadas. No se pudo verificar: ${msg.slice(0, 140)}` })
+      setStatus({
+        ok: false,
+        label: `Claves guardadas. No se pudo verificar: ${msg.slice(0, 140)} — Lo enviado: ${describePaste(kind, k, s)}`,
+      })
       onLog?.(`${meta.name}: claves guardadas, verificación fallida — ${msg}`, 'error')
     } finally {
       setBusy(false)

@@ -7,6 +7,7 @@ import {
   Pause,
   Percent,
   Play,
+  RefreshCw,
   Square,
   TrendingDown,
   TrendingUp,
@@ -222,8 +223,24 @@ export function BybitHeader({ bybit }: BybitHeaderProps) {
       </div>
 
       {bybit.haltedReason && (
-        <div className="border-t border-rose-500/30 bg-rose-500/10 px-4 py-2 text-center text-[11px] text-rose-300 md:px-6">
-          Bot detenido por el modo real: {bybit.haltedReason}
+        <div className="border-t border-rose-500/30 bg-rose-500/10 px-4 py-2 text-[11px] text-rose-300 md:px-6">
+          <p>Bot detenido por el modo real: {bybit.haltedReason}</p>
+          {/saldo real|posici[oó]n/i.test(bybit.haltedReason) && (
+            <div className="mt-1.5 flex flex-wrap items-center justify-center gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 gap-1.5 text-[11px]"
+                onClick={() => void bybit.syncWithExchange()}
+              >
+                <RefreshCw className="size-3" /> Sincronizar con el exchange
+              </Button>
+              <span className="text-[10px] text-rose-200/70">
+                Adopta el saldo real de Bybit y cierra lo que ya no exista. No
+                coloca órdenes.
+              </span>
+            </div>
+          )}
         </div>
       )}
     </header>

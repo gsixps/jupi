@@ -36,9 +36,18 @@ import {
   binanceMarketOrder,
   binanceMinNotional,
   loadCreds,
+  type ExchangeBalance,
   type ExchangeCredentials,
 } from '@/lib/cex'
 import type { EquityPoint } from '@/lib/trading-types'
+import {
+  clearLiveSnapshot,
+  loadLiveSnapshot,
+  reconcileLiveState,
+  saveLiveSnapshot,
+} from '@/lib/live-state'
+
+const LIVE_BOT = 'binance'
 
 const PRICE_HISTORY_CAP = 60
 const TRADE_CAP = 200
@@ -224,16 +233,27 @@ export function useBinanceBot() {
       }
       priceHistory[r.symbol] = h
     }
+    // LIVE positions survive a refresh: without this the bot forgets the coins
+    // it owns on Binance and buys the same asset twice.
+    const snap = loadLiveSnapshot<BinanceHolding>(LIVE_BOT)
     return {
       enabled: false,
       config: { ...DEFAULT_BINANCE_CONFIG },
-      cashUsd: DEFAULT_BINANCE_CONFIG.capitalUsd,
+      cashUsd: snap?.cashUsd ?? DEFAULT_BINANCE_CONFIG.capitalUsd,
       rows,
-      holdings: [],
+      holdings: snap?.open ?? [],
       trades: [],
       stats: null,
       equityCurve: [],
-      logs: [],
+      logs: snap
+        ? [
+            {
+              time: Date.now(),
+              msg: `Sesión live restaurada: ${snap.open.length} posición(es) abierta(s) desde ${new Date(snap.savedAt).toLocaleString()}. Se verificará contra Binance al arrancar.`,
+              level: 'info',
+            },
+          ]
+        : [],
       status: 'idle',
       priceHistory,
       opps: [],
@@ -334,7 +354,7 @@ export function useBinanceBot() {
 
       // 2. SELL logic — scan open holdings (spread converged? stop? trail?)
       let cash = stateRef.current.cashUsd
-      const holdings = stateRef.current.holdings.map((h) => ({ ...h }))
+      let holdings = stateRef.current.holdings.map((h) => ({ ...h }))
       const trades = [...stateRef.current.trades]
       const opps: BinanceArbOpportunity[] = []
 
@@ -348,8 +368,9 @@ export function useBinanceBot() {
           halt('faltan credenciales de Binance (API key + secret)')
           return
         }
+        let bals: ExchangeBalance[]
         try {
-          const bals = await binanceGetBalances(cred)
+          bals = await binanceGetBalances(cred)
           const usdt = bals.find((b) => b.symbol === 'USDT')
           if (!usdt) {
             halt('la cuenta de Binance no tiene saldo en USDT')
@@ -359,6 +380,46 @@ export function useBinanceBot() {
         } catch (e) {
           halt(`no se pudo leer el saldo real: ${(e as Error).message}`)
           return
+        }
+
+        // Binance decides the quantities: a refresh, a manual sell or a partial
+        // fill all end up here.
+        const open = holdings.filter((h) => h.status === 'open')
+        if (open.length > 0) {
+          const balances = new Map<string, number>()
+          for (const b of bals) balances.set(b.symbol, b.free)
+          const rec = reconcileLiveState<BinanceHolding>({
+            bot: LIVE_BOT,
+            persisted: open,
+            balances,
+            minQty: 0.00000001,
+            view: (h) => ({ liveAsset: h.token, liveQty: h.realBaseQty ?? 0, liveLabel: h.routeName }),
+            withQty: (h, qty) => ({ ...h, realBaseQty: qty }),
+          })
+          for (const n of rec.notes) log(`Binance: ${n}`, 'info')
+          if (rec.fatal) {
+            halt(rec.fatal)
+            return
+          }
+          const gone = new Set(rec.missing.map((h) => h.id))
+          holdings = [
+            ...rec.holdings,
+            ...open
+              .filter((h) => gone.has(h.id))
+              .map((h) => ({
+                ...h,
+                status: 'sold' as const,
+                soldAt: Date.now(),
+                sellPrice: h.currentPrice,
+                pnlUsd: 0,
+              })),
+          ]
+          if (rec.missing.length > 0) {
+            log(
+              `Binance: ${rec.missing.length} posición(es) ya no existen en la cuenta y se marcan como cerradas`,
+              'warn'
+            )
+          }
         }
       }
 
@@ -724,6 +785,15 @@ export function useBinanceBot() {
         dataSource: liveData ? 'live' : 'mock',
       }))
 
+      // Persist only what a refresh must not lose: the open live positions.
+      if (cfg.liveTrading) {
+        saveLiveSnapshot(
+          LIVE_BOT,
+          holdings.filter((h) => h.status === 'open'),
+          { cashUsd: cash, wasRunning: true }
+        )
+      }
+
       if (buys === 0) {
         log(
           `Sin divergencias ≥ ${cfg.minSpreadBps}bps este ciclo — ${BINANCE_TRIANGLES.length} rutas rastreadas`,
@@ -792,11 +862,74 @@ export function useBinanceBot() {
       logs: [],
       opps: [],
     }))
+    clearLiveSnapshot(LIVE_BOT)
     if (loopRef.current) {
       clearInterval(loopRef.current)
       loopRef.current = null
     }
     log(`Cuenta reiniciada a ${cfg.capitalUsd.toFixed(2)} USD`, 'info')
+  }, [log])
+
+  /**
+   * Resolve a reconciliation stop with Binance as the source of truth. Closes
+   * what the exchange no longer holds and lifts the halt. Never places an order.
+   */
+  const syncWithExchange = useCallback(async () => {
+    const cred = loadCreds('binance')
+    if (!cred) {
+      setState((s) => ({ ...s, halted: true, haltReason: 'no hay credenciales de Binance' }))
+      return
+    }
+    setState((s) => ({ ...s, status: 'scanning' }))
+    try {
+      const bals = await binanceGetBalances(cred)
+      const balances = new Map<string, number>()
+      for (const b of bals) balances.set(b.symbol, b.free)
+      const now = Date.now()
+      const open = stateRef.current.holdings.filter((h) => h.status === 'open')
+      const rec = reconcileLiveState<BinanceHolding>({
+        bot: LIVE_BOT,
+        persisted: open,
+        balances,
+        minQty: 0.00000001,
+        view: (h) => ({ liveAsset: h.token, liveQty: h.realBaseQty ?? 0, liveLabel: h.routeName }),
+        withQty: (h, qty) => ({ ...h, realBaseQty: qty }),
+      })
+      const gone = new Set(rec.missing.map((h) => h.id))
+      const holdings = [
+        ...open.filter((h) => !gone.has(h.id) && (h.realBaseQty ?? 0) > 0),
+        ...open
+          .filter((h) => gone.has(h.id))
+          .map((h) => ({
+            ...h,
+            status: 'sold' as const,
+            soldAt: now,
+            sellPrice: h.currentPrice,
+            pnlUsd: 0,
+          })),
+      ]
+      const cash = balances.get('USDT') ?? 0
+      setState((s) => ({
+        ...s,
+        holdings: [...s.holdings.filter((h) => h.status === 'sold'), ...holdings],
+        cashUsd: cash,
+        halted: false,
+        haltReason: null,
+        status: 'idle',
+      }))
+      saveLiveSnapshot(LIVE_BOT, holdings, { cashUsd: cash, wasRunning: false })
+      log(
+        `Sincronizado con Binance: ${holdings.length} posición(es) abierta(s), ${rec.missing.length} cerrada(s), USDT ${cash.toFixed(2)}`,
+        'info'
+      )
+      for (const n of rec.notes) log(`Binance: ${n}`, 'info')
+      if (rec.untracked.length > 0) {
+        log(`Binance: saldo sin posición registrada: ${rec.untracked.join(', ')}`, 'warn')
+      }
+    } catch (e) {
+      setState((s) => ({ ...s, status: 'idle' }))
+      log(`no se pudo sincronizar con Binance: ${(e as Error).message}`, 'error')
+    }
   }, [log])
 
   const updateConfig = useCallback((patch: Partial<BinanceConfig>) => {
@@ -823,6 +956,7 @@ export function useBinanceBot() {
     scan: () => scan(),
     updateConfig,
     resetAccount,
+    syncWithExchange,
     log,
     halt,
   }

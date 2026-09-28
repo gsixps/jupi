@@ -41,6 +41,14 @@ import {
     type BybitInstrumentFilters,
   } from '@/lib/cex'
 import type { EquityPoint } from '@/lib/trading-types'
+import {
+  clearLiveSnapshot,
+  loadLiveSnapshot,
+  reconcileLiveState,
+  saveLiveSnapshot,
+} from '@/lib/live-state'
+
+const LIVE_BOT = 'bybit'
 
 const PRICE_HISTORY_CAP = 60
 const TRADE_CAP = 200
@@ -273,16 +281,27 @@ export function useBybitBot() {
       priceHistory[r.spotSymbol] = [r.spotUsd]
       priceHistory[r.perpSymbol] = [r.perpUsd]
     }
+    // LIVE positions survive a refresh: without this the bot forgets the hedged
+    // pairs it holds on Bybit and re-opens the same trade.
+    const snap = loadLiveSnapshot<BybitHolding>(LIVE_BOT)
     return {
       enabled: false,
       config: { ...DEFAULT_BYBIT_CONFIG },
-      cashUsd: DEFAULT_BYBIT_CONFIG.capitalUsd,
+      cashUsd: snap?.cashUsd ?? DEFAULT_BYBIT_CONFIG.capitalUsd,
       rows,
-      holdings: [],
+      holdings: snap?.open ?? [],
       trades: [],
       stats: null,
       equityCurve: [],
-      logs: [],
+      logs: snap
+        ? [
+            {
+              time: Date.now(),
+              msg: `Sesión live restaurada: ${snap.open.length} posición(es) abierta(s) desde ${new Date(snap.savedAt).toLocaleString()}. Se verificará contra Bybit al arrancar.`,
+              level: 'info',
+            },
+          ]
+        : [],
       status: 'idle',
       priceHistory,
       opps: [],
@@ -379,6 +398,49 @@ export function useBybitBot() {
       let holdings = s0.holdings.map((h) => ({ ...h }))
       const trades = [...s0.trades]
       const opps = [...s0.opps]
+
+      // The exchange decides the quantities: a refresh, a manual close or a
+      // partial fill all end up here. Bybit hedges hold the token on SPOT, so
+      // the spot balance is what the reconciliation compares against.
+      if (realMode && cred) {
+        const open = holdings.filter((h) => h.status === 'open')
+        if (open.length > 0) {
+          const balances = new Map<string, number>()
+          for (const b of bals) balances.set(b.symbol, b.free)
+          const rec = reconcileLiveState<BybitHolding>({
+            bot: LIVE_BOT,
+            persisted: open,
+            balances,
+            minQty: 0.00000001,
+            view: (h) => ({ liveAsset: h.token, liveQty: h.spotQty, liveLabel: `${h.company} (${h.pairId})` }),
+            withQty: (h, qty) => ({ ...h, spotQty: qty }),
+          })
+          for (const n of rec.notes) log(`Bybit: ${n}`, 'info')
+          if (rec.fatal) {
+            inFlightRef.current = false
+            halt(rec.fatal)
+            return
+          }
+          const gone = new Set(rec.missing.map((h) => h.id))
+          holdings = [
+            ...rec.holdings,
+            ...open
+              .filter((h) => gone.has(h.id))
+              .map((h) => ({
+                ...h,
+                status: 'closed' as const,
+                closedAt: now,
+                pnlUsd: 0,
+              })),
+          ]
+          if (rec.missing.length > 0) {
+            log(
+              `Bybit: ${rec.missing.length} posición(es) ya no existen en la cuenta y se marcan como cerradas`,
+              'warn'
+            )
+          }
+        }
+      }
 
       // 3. CLOSE hedged positions whose basis converged (or stop / trail)
       for (const h of holdings) {
@@ -769,6 +831,15 @@ export function useBybitBot() {
         lastUpdatedAt: now,
         haltedReason: null,
       }))
+
+      // Persist only what a refresh must not lose: the open hedged positions.
+      if (cfg.liveTrading) {
+        saveLiveSnapshot(
+          LIVE_BOT,
+          holdings.filter((h) => h.status === 'open'),
+          { cashUsd: cash, wasRunning: true }
+        )
+      }
     } catch (e) {
       // A real-money failure must stop the bot rather than be retried blindly.
       if (stateRef.current.config.liveTrading) halt(`error de scan: ${(e as Error).message}`)
@@ -830,8 +901,64 @@ export function useBybitBot() {
       status: 'idle',
       haltedReason: null,
     }))
+    clearLiveSnapshot(LIVE_BOT)
     log('Cuenta reiniciada')
   }, [log, stop])
+
+  /**
+   * Resolve a reconciliation stop with Bybit as the source of truth. Closes what
+   * the exchange no longer holds and lifts the halt. Never places an order.
+   */
+  const syncWithExchange = useCallback(async () => {
+    const cred = loadCreds('bybit')
+    if (!cred) {
+      setState((s) => ({ ...s, haltedReason: 'no hay credenciales de Bybit' }))
+      return
+    }
+    setState((s) => ({ ...s, status: 'scanning' }))
+    try {
+      const bals = await bybitGetBalances(cred)
+      const balances = new Map<string, number>()
+      for (const b of bals) balances.set(b.symbol, b.free)
+      const now = Date.now()
+      const open = stateRef.current.holdings.filter((h) => h.status === 'open')
+      const rec = reconcileLiveState<BybitHolding>({
+        bot: LIVE_BOT,
+        persisted: open,
+        balances,
+        minQty: 0.00000001,
+        view: (h) => ({ liveAsset: h.token, liveQty: h.spotQty, liveLabel: `${h.company} (${h.pairId})` }),
+        withQty: (h, qty) => ({ ...h, spotQty: qty }),
+      })
+      const gone = new Set(rec.missing.map((h) => h.id))
+      const holdings = [
+        ...open.filter((h) => !gone.has(h.id) && h.spotQty > 0),
+        ...open
+          .filter((h) => gone.has(h.id))
+          .map((h) => ({ ...h, status: 'closed' as const, closedAt: now, pnlUsd: 0 })),
+      ]
+      const cash = bybitUsdtFree(bals)
+      setState((s) => ({
+        ...s,
+        holdings: [...s.holdings.filter((h) => h.status === 'closed'), ...holdings],
+        cashUsd: cash,
+        haltedReason: null,
+        status: 'idle',
+      }))
+      saveLiveSnapshot(LIVE_BOT, holdings, { cashUsd: cash, wasRunning: false })
+      log(
+        `Sincronizado con Bybit: ${holdings.length} posición(es) abierta(s), ${rec.missing.length} cerrada(s), USDT ${cash.toFixed(2)}`,
+        'info'
+      )
+      for (const n of rec.notes) log(`Bybit: ${n}`, 'info')
+      if (rec.untracked.length > 0) {
+        log(`Bybit: saldo sin posición registrada: ${rec.untracked.join(', ')}`, 'warn')
+      }
+    } catch (e) {
+      setState((s) => ({ ...s, status: 'idle' }))
+      log(`no se pudo sincronizar con Bybit: ${(e as Error).message}`, 'error')
+    }
+  }, [log])
 
   useEffect(() => {
     return () => {
@@ -848,6 +975,7 @@ export function useBybitBot() {
     scan: () => scan(),
     updateConfig,
     resetAccount,
+    syncWithExchange,
     log,
   }
 }

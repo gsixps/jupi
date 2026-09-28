@@ -385,6 +385,110 @@ export function krakenBaseAsset(token: string): string {
   return token
 }
 
+export interface KrakenPreflightRoute {
+  token: string
+  pair: string
+  priceUsd: number
+  costmin: number
+  ordermin: number
+  /** Base quantity a $budget order would buy, at the pair's precision. */
+  lot: number
+  tradable: boolean
+  why: string
+}
+
+export interface KrakenPreflight {
+  ok: boolean
+  usdFree: number
+  budgetUsd: number
+  routes: KrakenPreflightRoute[]
+  blockers: string[]
+  notes: string[]
+}
+
+/**
+ * Read-only readiness check for real money. It signs ONE private call (Balance)
+ * and reads public Ticker/AssetPairs: it never places an order, so the user can
+ * answer "¿puedo operar ya?" before risking anything.
+ */
+export async function krakenPreflight(
+  cred: ExchangeCredentials,
+  pairs: { token: string; pair: string }[],
+  budgetUsd: number
+): Promise<KrakenPreflight> {
+  const blockers: string[] = []
+  const notes: string[] = []
+  let bals: ExchangeBalance[]
+  try {
+    bals = await krakenGetBalances(cred)
+  } catch (e) {
+    return {
+      ok: false,
+      usdFree: 0,
+      budgetUsd,
+      routes: [],
+      blockers: [`No se pudo leer la cuenta: ${(e as Error).message}`],
+      notes: [],
+    }
+  }
+  const usdFree = krakenUsdFree(bals)
+  if (usdFree <= 0) blockers.push('La cuenta no tiene USD libre (Kraken lo llama ZUSD).')
+  if (!(budgetUsd > 0)) blockers.push('El presupuesto por operación es 0.')
+  else if (budgetUsd > usdFree) {
+    blockers.push(
+      `El presupuesto por operación (${budgetUsd.toFixed(2)} USD) supera el USD libre (${usdFree.toFixed(2)}).`
+    )
+  }
+  if (usdFree < 0.5) {
+    notes.push('Kraken exige un coste mínimo de 0.50 USD por orden.')
+  }
+
+  const routes: KrakenPreflightRoute[] = []
+  for (const { token, pair } of pairs) {
+    let priceUsd = 0
+    try {
+      const r = await fetch(`https://api.kraken.com/0/public/Ticker?pair=${encodeURIComponent(pair)}`)
+      const j = (await r.json()) as { result?: Record<string, { c?: [string] }> }
+      const first = j.result ? Object.values(j.result)[0] : undefined
+      priceUsd = parseFloat(first?.c?.[0] ?? "0") || 0
+    } catch {
+      priceUsd = 0
+    }
+    const filters = await krakenOrderFilters(pair)
+    const lot = priceUsd > 0 ? krakenRoundVolume(budgetUsd / priceUsd, filters) : 0
+    const cost = lot * priceUsd
+    let why = 'operable'
+    let tradable = true
+    if (!(priceUsd > 0)) {
+      tradable = false
+      why = `sin precio en Kraken para ${pair}`
+    } else if (cost < filters.costmin) {
+      tradable = false
+      why = `${cost.toFixed(2)} USD por debajo del coste mínimo (${filters.costmin})`
+    } else if (lot < filters.ordermin) {
+      tradable = false
+      why = `${lot} ${token} por debajo del mínimo (${filters.ordermin})`
+    } else if (cost < budgetUsd * 0.9) {
+      // Precision rounding eats a big slice of a small order.
+      tradable = false
+      why = `la precisión del par deja ${cost.toFixed(2)} USD de ${budgetUsd.toFixed(2)} (pierdes más del 10%)`
+    }
+    routes.push({ token, pair, priceUsd, costmin: filters.costmin, ordermin: filters.ordermin, lot, tradable, why })
+  }
+
+  const tradableCount = routes.filter((r) => r.tradable).length
+  if (tradableCount === 0) {
+    blockers.push(
+      `Ninguna ruta es operable con ${budgetUsd.toFixed(2)} USD. Sube el presupuesto por operación o acepta las rutas que sí cumplen el mínimo.`
+    )
+  } else {
+    notes.push(`${tradableCount}/${routes.length} rutas operables con ${budgetUsd.toFixed(2)} USD.`)
+  }
+  notes.push('Kraken cobra comisión por orden (taker ~0.26%): el margen debe superarla.')
+
+  return { ok: blockers.length === 0, usdFree, budgetUsd, routes, blockers, notes }
+}
+
 /**
  * Free USD balance on Kraken. The REST API names fiat USD `ZUSD` and also
  * exposes a `USD` alias, so accept either (or the USDT/USDC stables) and sum
