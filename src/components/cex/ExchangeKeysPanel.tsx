@@ -139,12 +139,14 @@ export function ExchangeKeysPanel({
   const [apiKey, setApiKey] = useState('')
   const [apiSecret, setApiSecret] = useState('')
   const [hasCreds, setHasCreds] = useState(false)
+  const [verified, setVerified] = useState(false)
   const [showSecret, setShowSecret] = useState(false)
   const [busy, setBusy] = useState(false)
   const [status, setStatus] = useState<{ ok: boolean; label: string } | null>(null)
 
   useEffect(() => {
     setHasCreds(!!loadCreds(kind))
+    setVerified(false)
     setStatus(null)
   }, [kind])
 
@@ -163,6 +165,7 @@ export function ExchangeKeysPanel({
     try {
       const res = await verify(cred)
       setStatus(res)
+      setVerified(res.ok)
       if (res.ok) {
         setApiKey('')
         setApiSecret('')
@@ -199,6 +202,7 @@ export function ExchangeKeysPanel({
     try {
       const res = await verify(cred)
       setStatus(res)
+      setVerified(res.ok)
       onLog?.(
         res.ok ? `${meta.name}: ${res.label}` : `${meta.name}: ${res.label}`,
         res.ok ? 'info' : 'error'
@@ -215,6 +219,7 @@ export function ExchangeKeysPanel({
   const handleClear = useCallback(() => {
     clearCreds(kind)
     setHasCreds(false)
+    setVerified(false)
     setStatus(null)
     onLog?.(`${meta.name}: claves eliminadas del navegador.`)
   }, [kind, onLog, meta.name])
@@ -313,7 +318,7 @@ export function ExchangeKeysPanel({
 
       <p className="text-[10px] text-muted-foreground">
         {kind === 'kraken'
-          ? 'Kraken no permite CORS: las peticiones firmadas salen por el proxy local /api/kraken de esta misma máquina (Next.js). Las claves no se guardan en el servidor.'
+          ? 'Kraken no permite CORS: las peticiones firmadas pasan por /api/kraken (Next.js). En un despliegue Vercel, las credenciales transitan por esa función para firmar la petición; este código no las persiste en base de datos.'
           : 'Las claves se firman desde este navegador y solo se guardan aquí (localStorage).'}
       </p>
 
@@ -329,10 +334,10 @@ export function ExchangeKeysPanel({
           </p>
         </div>
         <Switch
-          checked={liveEnabled && hasCreds}
+          checked={liveEnabled && hasCreds && verified}
           onCheckedChange={(v) => {
-            if (!hasCreds) {
-              setStatus({ ok: false, label: 'Guarda y verifica las claves primero.' })
+            if (!hasCreds || !verified) {
+              setStatus({ ok: false, label: 'Guarda y verifica correctamente las claves antes de activar dinero real.' })
               return
             }
             onLiveEnabledChange(v)
