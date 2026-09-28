@@ -11,7 +11,7 @@
 //      ≥ minSpreadBps: buy the token via the cheap leg, target the dear leg.
 //   4. Update stats + log everything.
 //
-// Paper mode uses FICTIONAL USD. When liveTrading is explicitly enabled with verified credentials, real Kraken orders may be placed.
+// Paper mode is fictional. LIVE mode can place real Kraken orders only after explicit activation and safety checks.
 
 'use client'
 
@@ -53,6 +53,14 @@ const PRICE_HISTORY_CAP = 60
 const TRADE_CAP = 200
 const LOG_CAP = 120
 
+// LIVE SAFETY DEFAULTS.
+// These are risk controls, not a promise of profitability.
+const LIVE_MAX_ORDER_USD = 10
+const LIVE_MIN_SIGNAL_BPS = 100
+const LIVE_MAX_DAILY_LOSS_USD = 5
+const LIVE_MAX_CONSECUTIVE_LOSSES = 3
+const LIVE_COOLDOWN_MS = 60_000
+
 export interface KrakenConfig {
   capitalUsd: number
   budgetPerTradeUsd: number
@@ -68,15 +76,15 @@ export interface KrakenConfig {
 }
 
 export const DEFAULT_KRAKEN_CONFIG: KrakenConfig = {
-  capitalUsd: 10000,
-  budgetPerTradeUsd: 2000,
-  maxHoldings: 6,
-  minSpreadBps: 3,
-  stopLossBps: 2,
-  trailingBps: 2,
+  capitalUsd: 1000,
+  budgetPerTradeUsd: 10,
+  maxHoldings: 1,
+  minSpreadBps: 100,
+  stopLossBps: 100,
+  trailingBps: 50,
   tickIntervalMs: 10000,
   dataMode: 'live',
-  compound: true,
+  compound: false,
   liveTrading: false,
 }
 
@@ -290,6 +298,12 @@ export function useKrakenBot() {
   stateRef.current = state
   const loopRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const inFlightRef = useRef(false)
+  const liveRiskRef = useRef({
+    day: new Date().toISOString().slice(0, 10),
+    realizedPnl: 0,
+    consecutiveLosses: 0,
+    lastOrderAt: 0,
+  })
 
   const log = useCallback((msg: string, level: KrakenLogEntry['level'] = 'info') => {
     setState((s) => ({
@@ -452,7 +466,7 @@ export function useKrakenBot() {
         const s = routeSpread(route, raw)
         if (!s) continue
         // current normalized USD per token depends on which leg was bought
-        const cur = h.side === 'cross_cheap' ? s.directUsd : s.impliedUsd
+        const cur = cfg.liveTrading ? s.directUsd : (h.side === 'cross_cheap' ? s.directUsd : s.impliedUsd)
         h.currentPrice = cur
         const target = h.buyPrice * (1 + cfg.minSpreadBps / 10000)
         const stop = h.buyPrice * (1 - cfg.stopLossBps / 10000)
@@ -536,7 +550,25 @@ export function useKrakenBot() {
               `⚡ Interés compuesto: capital disponible → ${fmtUsdKraken(cash, 2)} USD (P&L real ${pnl >= 0 ? '+' : ''}${fmtUsdKraken(pnl, 2)})`,
               'info'
             )
+            const risk = liveRiskRef.current
+            const today = new Date().toISOString().slice(0, 10)
+            if (risk.day !== today) {
+              risk.day = today
+              risk.realizedPnl = 0
+              risk.consecutiveLosses = 0
+            }
+            risk.realizedPnl += pnl
+            risk.consecutiveLosses = pnl < 0 ? risk.consecutiveLosses + 1 : 0
+            risk.lastOrderAt = Date.now()
             realTrades++
+            if (risk.realizedPnl <= -LIVE_MAX_DAILY_LOSS_USD) {
+              halt(`límite diario alcanzado: P&L real ${risk.realizedPnl.toFixed(2)} USD`)
+              return
+            }
+            if (risk.consecutiveLosses >= LIVE_MAX_CONSECUTIVE_LOSSES) {
+              halt(`${risk.consecutiveLosses} pérdidas reales consecutivas; revisión manual requerida`)
+              return
+            }
             continue
           }
 
@@ -622,21 +654,48 @@ export function useKrakenBot() {
         // Execution always happens on the USD leg of the route, which keeps
         // the position a single asset denominated in USD.
         if (cfg.liveTrading && cred) {
-          const pair = route.directSymbol
+          // This implementation places a REAL position only on the direct USD pair.
+          // If the cross route is the cheap leg, executing only the direct leg would
+          // NOT be triangular arbitrage, so it is deliberately skipped.
+          if (crossCheap) {
+            log(`⏭ ${route.name}: señal cross-cheap omitida en LIVE; requiere ejecución multi-leg atómica`, 'warn')
+            continue
+          }
 
-          // Safety: fictional bot cash must never be treated as real Kraken cash.
-          // Re-read the exchange balance immediately before a live BUY.
+          if (spread < LIVE_MIN_SIGNAL_BPS) continue
+
+          const risk = liveRiskRef.current
+          const today = new Date().toISOString().slice(0, 10)
+          if (risk.day !== today) {
+            risk.day = today
+            risk.realizedPnl = 0
+            risk.consecutiveLosses = 0
+          }
+          if (risk.realizedPnl <= -LIVE_MAX_DAILY_LOSS_USD) {
+            halt(`límite diario alcanzado: ${risk.realizedPnl.toFixed(2)} USD`)
+            return
+          }
+          if (risk.consecutiveLosses >= LIVE_MAX_CONSECUTIVE_LOSSES) {
+            halt(`${risk.consecutiveLosses} pérdidas consecutivas; revisión manual requerida`)
+            return
+          }
+          if (Date.now() - risk.lastOrderAt < LIVE_COOLDOWN_MS) {
+            continue
+          }
+
+          // Never let the configurable/paper budget become a large real order.
+          const liveNotional = Math.min(notional, LIVE_MAX_ORDER_USD)
+
+          // Re-read Kraken immediately before every real BUY.
           let realUsdFree = 0
           try {
             realUsdFree = krakenUsdFree(await krakenGetBalances(cred))
           } catch (e) {
-            halt(`no se pudo comprobar el saldo real de Kraken antes de BUY: ${(e as Error).message}`)
+            halt(`no se pudo comprobar el saldo real antes de BUY: ${(e as Error).message}`)
             return
           }
-          if (realUsdFree + 1e-9 < notional) {
-            halt(
-              `saldo real insuficiente: Kraken tiene ${realUsdFree.toFixed(2)} USD libres y la orden necesita ${notional.toFixed(2)} USD`
-            )
+          if (realUsdFree + 1e-9 < liveNotional) {
+            halt(`saldo real insuficiente: ${realUsdFree.toFixed(2)} USD libres; orden prevista ${liveNotional.toFixed(2)} USD`)
             return
           }
 
@@ -647,11 +706,11 @@ export function useKrakenBot() {
             return
           }
           const filters = await krakenOrderFilters(pair).catch(() => null)
-          const lot = filters ? krakenRoundVolume(notional / price, filters) : notional / price
-          if (filters && (filters.costmin > 0 && notional < filters.costmin ||
+          const lot = filters ? krakenRoundVolume(liveNotional / price, filters) : liveNotional / price
+          if (filters && (filters.costmin > 0 && liveNotional < filters.costmin ||
                           filters.ordermin > 0 && lot < filters.ordermin)) {
             log(
-              `⏭ ${route.name}: ${fmtUsdKraken(notional, 2)} USD / ${lot} ${route.token} por debajo del mínimo de Kraken (${filters.costmin} USD / ${filters.ordermin}) — se omite`,
+              `⏭ ${route.name}: ${fmtUsdKraken(liveNotional, 2)} USD / ${lot} ${route.token} por debajo del mínimo de Kraken (${filters.costmin} USD / ${filters.ordermin}) — se omite`,
               'warn'
             )
             continue
@@ -716,6 +775,7 @@ export function useKrakenBot() {
           })
           cash -= spent
           buys++
+          liveRiskRef.current.lastOrderAt = Date.now()
           realTrades++
           log(
             `LIVE BUY ${pair} ${order.executedQty} @ ${fillPrice.toFixed(6)} — ${fmtUsdKraken(spent, 2)} USD (${s.spreadBps >= 0 ? '+' : ''}${s.spreadBps}bps)`,
