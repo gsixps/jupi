@@ -11,7 +11,7 @@
 //      ≥ minSpreadBps: buy the token via the cheap leg, target the dear leg.
 //   4. Update stats + log everything.
 //
-// Capital is FICTIONAL (USD). No real orders are placed.
+// Paper mode uses FICTIONAL USD. When liveTrading is explicitly enabled with verified credentials, real Kraken orders may be placed.
 
 'use client'
 
@@ -622,6 +622,24 @@ export function useKrakenBot() {
         // Execution always happens on the USD leg of the route, which keeps
         // the position a single asset denominated in USD.
         if (cfg.liveTrading && cred) {
+          const pair = route.directSymbol
+
+          // Safety: fictional bot cash must never be treated as real Kraken cash.
+          // Re-read the exchange balance immediately before a live BUY.
+          let realUsdFree = 0
+          try {
+            realUsdFree = krakenUsdFree(await krakenGetBalances(cred))
+          } catch (e) {
+            halt(`no se pudo comprobar el saldo real de Kraken antes de BUY: ${(e as Error).message}`)
+            return
+          }
+          if (realUsdFree + 1e-9 < notional) {
+            halt(
+              `saldo real insuficiente: Kraken tiene ${realUsdFree.toFixed(2)} USD libres y la orden necesita ${notional.toFixed(2)} USD`
+            )
+            return
+          }
+
           const pair = route.directSymbol
           const price = raw[pair] ?? 0
           if (!(price > 0)) {
