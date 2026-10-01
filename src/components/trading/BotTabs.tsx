@@ -14,6 +14,7 @@ import {
   Building2,
   PiggyBank,
   Landmark,
+  Target,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useBotStatusContext, type BotStatusMap } from '@/components/trading/BotsProvider'
@@ -51,7 +52,9 @@ export function BotTabs() {
                       ? 'carry'
                       : pathname === '/dashboard/gold'
                         ? 'gold'
-                        : 'jupiter'
+                        : pathname === '/dashboard/polymarket'
+                          ? 'poly'
+                          : 'jupiter'
 
   const running = Object.values(status).filter((s) => s.running).length
   const liveCount = Object.values(status).filter((s) => s.running && s.real).length
@@ -109,6 +112,10 @@ export function BotTabs() {
         <TabLink href="/dashboard/gold" base={base} active={current === 'gold'} status={status.gold}>
           <Landmark className="size-3.5" />
           Oro
+        </TabLink>
+        <TabLink href="/dashboard/polymarket" base={base} active={current === 'poly'} status={status.poly}>
+          <Target className="size-3.5" />
+          Polymarket
         </TabLink>
       </div>
 

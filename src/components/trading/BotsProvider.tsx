@@ -26,6 +26,7 @@ import { useTrendBot } from '@/hooks/use-trend'
 import { useBybitBot } from '@/hooks/use-bybit'
 import { useCarryBot } from '@/hooks/use-carry'
 import { useGoldBot } from '@/hooks/use-gold'
+import { usePolyCopyBot } from '@/hooks/use-polycopy'
 
 export type BinanceBot = ReturnType<typeof useBinanceBot>
 export type KrakenBot = ReturnType<typeof useKrakenBot>
@@ -36,6 +37,7 @@ export type CoinBot = ReturnType<typeof useTrendBot>
 export type BybitBot = ReturnType<typeof useBybitBot>
 export type CarryBot = ReturnType<typeof useCarryBot>
 export type GoldBot = ReturnType<typeof useGoldBot>
+export type PolyCopyBot = ReturnType<typeof usePolyCopyBot>
 export type PaperBot = ReturnType<typeof usePaperTrading>
 export type LiveBot = ReturnType<typeof useLiveTrading>
 export type Wallet = ReturnType<typeof useWallet>
@@ -64,6 +66,7 @@ export interface BotStatusMap {
   bybit: BotStatus
   carry: BotStatus
   gold: BotStatus
+  poly: BotStatus
 }
 
 function createBotContext<T>(name: string) {
@@ -92,6 +95,7 @@ const coinEthCtx = createBotContext<CoinBot>('CoinBotEth')
 const bybitCtx = createBotContext<BybitBot>('BybitBot')
 const carryCtx = createBotContext<CarryBot>('CarryBot')
 const goldCtx = createBotContext<GoldBot>('GoldBot')
+const polyCtx = createBotContext<PolyCopyBot>('PolyCopyBot')
 const statusCtx = createBotContext<BotStatusMap>('BotStatus')
 
 export const usePaperBotContext = jupiterPaperCtx.useBotContext
@@ -107,6 +111,7 @@ export const useCoinEthContext = coinEthCtx.useBotContext
 export const useBybitBotContext = bybitCtx.useBotContext
 export const useCarryBotContext = carryCtx.useBotContext
 export const useGoldBotContext = goldCtx.useBotContext
+export const usePolyCopyBotContext = polyCtx.useBotContext
 export const useBotStatusContext = statusCtx.useBotContext
 
 export function BotsProvider({ children }: { children: React.ReactNode }) {
@@ -127,6 +132,7 @@ export function BotsProvider({ children }: { children: React.ReactNode }) {
   const bybit = useBybitBot()
   const carry = useCarryBot()
   const gold = useGoldBot()
+  const poly = usePolyCopyBot()
 
   // Coarse primitives for the tab bar. Reading them here keeps the memo below
   // from depending on the bot objects, whose identity changes on every tick.
@@ -157,6 +163,8 @@ export function BotsProvider({ children }: { children: React.ReactNode }) {
   const carryLive = carry.liveTrading
   const goldEnabled = gold.enabled
   const goldLive = gold.liveTrading
+  const polyEnabled = poly.enabled
+  const polyLive = poly.liveTrading
 
   // Depend on the primitive flags only. Depending on the bot objects would
   // rebuild this map on every price tick and re-render the tab bar constantly.
@@ -173,6 +181,7 @@ export function BotsProvider({ children }: { children: React.ReactNode }) {
       bybit: flags(bybitEnabled, bybitLive, 'Bybit RWA'),
       carry: flags(carryEnabled, carryLive, 'Rendimiento'),
       gold: flags(goldEnabled, goldLive, 'Oro'),
+      poly: flags(polyEnabled, polyLive, 'Polymarket'),
     }),
     [
       paperEnabled,
@@ -197,6 +206,8 @@ export function BotsProvider({ children }: { children: React.ReactNode }) {
       carryLive,
       goldEnabled,
       goldLive,
+      polyEnabled,
+      polyLive,
     ]
   )
 
@@ -214,9 +225,11 @@ export function BotsProvider({ children }: { children: React.ReactNode }) {
                         <bybitCtx.Ctx.Provider value={bybit}>
                         <carryCtx.Ctx.Provider value={carry}>
                         <goldCtx.Ctx.Provider value={gold}>
+                        <polyCtx.Ctx.Provider value={poly}>
                           <statusCtx.Ctx.Provider value={status}>
                             {children}
                           </statusCtx.Ctx.Provider>
+                        </polyCtx.Ctx.Provider>
                         </goldCtx.Ctx.Provider>
                         </carryCtx.Ctx.Provider>
                         </bybitCtx.Ctx.Provider>
