@@ -24,6 +24,7 @@ import { useSeabot } from '@/hooks/use-seabot'
 import { usePumpFunBot } from '@/hooks/use-pumpfun'
 import { useTrendBot } from '@/hooks/use-trend'
 import { useBybitBot } from '@/hooks/use-bybit'
+import { useCarryBot } from '@/hooks/use-carry'
 
 export type BinanceBot = ReturnType<typeof useBinanceBot>
 export type KrakenBot = ReturnType<typeof useKrakenBot>
@@ -32,6 +33,7 @@ export type SeabotBot = ReturnType<typeof useSeabot>
 export type PumpFunBot = ReturnType<typeof usePumpFunBot>
 export type CoinBot = ReturnType<typeof useTrendBot>
 export type BybitBot = ReturnType<typeof useBybitBot>
+export type CarryBot = ReturnType<typeof useCarryBot>
 export type PaperBot = ReturnType<typeof usePaperTrading>
 export type LiveBot = ReturnType<typeof useLiveTrading>
 export type Wallet = ReturnType<typeof useWallet>
@@ -58,6 +60,7 @@ export interface BotStatusMap {
   bitcoin: BotStatus
   eth: BotStatus
   bybit: BotStatus
+  carry: BotStatus
 }
 
 function createBotContext<T>(name: string) {
@@ -84,6 +87,7 @@ const pumpfunCtx = createBotContext<PumpFunBot>('PumpFunBot')
 const coinBtcCtx = createBotContext<CoinBot>('CoinBotBtc')
 const coinEthCtx = createBotContext<CoinBot>('CoinBotEth')
 const bybitCtx = createBotContext<BybitBot>('BybitBot')
+const carryCtx = createBotContext<CarryBot>('CarryBot')
 const statusCtx = createBotContext<BotStatusMap>('BotStatus')
 
 export const usePaperBotContext = jupiterPaperCtx.useBotContext
@@ -97,6 +101,7 @@ export const usePumpFunBotContext = pumpfunCtx.useBotContext
 export const useCoinBtcContext = coinBtcCtx.useBotContext
 export const useCoinEthContext = coinEthCtx.useBotContext
 export const useBybitBotContext = bybitCtx.useBotContext
+export const useCarryBotContext = carryCtx.useBotContext
 export const useBotStatusContext = statusCtx.useBotContext
 
 export function BotsProvider({ children }: { children: React.ReactNode }) {
@@ -115,6 +120,7 @@ export function BotsProvider({ children }: { children: React.ReactNode }) {
   const coinBtc = useTrendBot('btc')
   const coinEth = useTrendBot('eth')
   const bybit = useBybitBot()
+  const carry = useCarryBot()
 
   // Coarse primitives for the tab bar. Reading them here keeps the memo below
   // from depending on the bot objects, whose identity changes on every tick.
@@ -141,6 +147,8 @@ export function BotsProvider({ children }: { children: React.ReactNode }) {
   const ethLive = coinEth.liveTrading
   const bybitEnabled = bybit.enabled
   const bybitLive = bybit.config.liveTrading
+  const carryEnabled = carry.enabled
+  const carryLive = carry.liveTrading
 
   // Depend on the primitive flags only. Depending on the bot objects would
   // rebuild this map on every price tick and re-render the tab bar constantly.
@@ -155,6 +163,7 @@ export function BotsProvider({ children }: { children: React.ReactNode }) {
       bitcoin: flags(btcEnabled, btcLive, 'Bitcoin'),
       eth: flags(ethEnabled, ethLive, 'Eth'),
       bybit: flags(bybitEnabled, bybitLive, 'Bybit RWA'),
+      carry: flags(carryEnabled, carryLive, 'Rendimiento'),
     }),
     [
       paperEnabled,
@@ -175,6 +184,8 @@ export function BotsProvider({ children }: { children: React.ReactNode }) {
       ethLive,
       bybitEnabled,
       bybitLive,
+      carryEnabled,
+      carryLive,
     ]
   )
 
@@ -190,9 +201,11 @@ export function BotsProvider({ children }: { children: React.ReactNode }) {
                     <coinBtcCtx.Ctx.Provider value={coinBtc}>
                       <coinEthCtx.Ctx.Provider value={coinEth}>
                         <bybitCtx.Ctx.Provider value={bybit}>
+                        <carryCtx.Ctx.Provider value={carry}>
                           <statusCtx.Ctx.Provider value={status}>
                             {children}
                           </statusCtx.Ctx.Provider>
+                        </carryCtx.Ctx.Provider>
                         </bybitCtx.Ctx.Provider>
                       </coinEthCtx.Ctx.Provider>
                     </coinBtcCtx.Ctx.Provider>
