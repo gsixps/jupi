@@ -120,7 +120,17 @@ function StatTile({
   )
 }
 
-function SideBadge({ type }: { type: 'buy' | 'sell' }) {
+function SideBadge({ type }: { type: 'buy' | 'sell' | 'cycle' }) {
+  if (type === 'cycle') {
+    return (
+      <Badge
+        variant="outline"
+        className="border-violet-500/40 bg-violet-500/10 text-violet-300"
+      >
+        3-LEG
+      </Badge>
+    )
+  }
   if (type === 'buy') {
     return (
       <Badge
@@ -142,7 +152,8 @@ function SideBadge({ type }: { type: 'buy' | 'sell' }) {
 }
 
 function TradeRow({ t }: { t: ReturnType<typeof useKrakenBot>['trades'][number] }) {
-  const isSell = t.type === 'sell'
+  // A 3-leg cycle closes in the same tick, so it shows a realized P&L like a sell.
+  const isSell = t.type !== 'buy'
   const win = t.pnlUsd >= 0
   return (
     <motion.div

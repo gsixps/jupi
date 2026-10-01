@@ -319,6 +319,17 @@ export function krakenRoundVolume(volume: number, filters: KrakenOrderFilters): 
   return Number(rounded.toFixed(8))
 }
 
+/** The order was ACCEPTED (txid) but its fill could not be confirmed before
+ *  the deadline. It may well have filled: never re-send or unwind blindly. */
+export class KrakenOrderUnconfirmedError extends Error {
+  constructor(public orderId: string) {
+    super(
+      `orden ${orderId} enviada pero sin confirmar (timeout/rate limit de Kraken). NO la reenvíes: revísala en Kraken → Órdenes antes de volver a arrancar.`
+    )
+    this.name = "KrakenOrderUnconfirmedError"
+  }
+}
+
 export async function krakenMarketOrder(opts: KrakenOrderOpts): Promise<ExchangeOrderResult> {
   const volume = Number(opts.volume.toFixed(8))
   if (!(volume > 0)) throw new Error("volume must be > 0")
@@ -380,9 +391,7 @@ export async function krakenMarketOrder(opts: KrakenOrderOpts): Promise<Exchange
     backoff = Math.min(backoff * 2, 4000)
   }
   if (!confirmed && executedQty <= 0) {
-    throw new Error(
-      `orden ${txid} enviada pero sin confirmar (timeout/rate limit de Kraken). NO la reenvíes: revísala en Kraken → Órdenes antes de volver a arrancar.`
-    )
+    throw new KrakenOrderUnconfirmedError(txid)
   }
   if (price > 0 && executedQty > 0 && executedQuote === 0) {
     executedQuote = price * executedQty

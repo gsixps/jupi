@@ -33,8 +33,6 @@ import {
   krakenBaseAsset,
   krakenGetBalances,
   krakenMarketOrder,
-  krakenOrderFilters,
-  krakenRoundVolume,
   krakenUsdFree,
   krakenStablesFree,
   loadCreds,
@@ -47,6 +45,13 @@ import {
   reconcileLiveState,
   saveLiveSnapshot,
 } from '@/lib/live-state'
+import {
+  cyclePathLabel,
+  planTriangleCycle,
+  type CyclePlan,
+  type TrianglePairBook,
+} from '@/lib/triangle-exec'
+import { executeLiveTriangle } from '@/lib/kraken-triangle-live'
 
 const LIVE_BOT = 'kraken'
 
@@ -57,7 +62,6 @@ const LOG_CAP = 120
 // LIVE SAFETY DEFAULTS.
 // These are risk controls, not a promise of profitability.
 const LIVE_MAX_ORDER_USD = 10
-const LIVE_MIN_SIGNAL_BPS = 100
 const LIVE_MAX_DAILY_LOSS_USD = 5
 const LIVE_MAX_CONSECUTIVE_LOSSES = 3
 const LIVE_COOLDOWN_MS = 60_000
@@ -68,10 +72,16 @@ const LIVE_MIN_ORDER_USD = 0.5
 /** Take-profit floor in LIVE: must clear the round trip of taker fees
  *  (2 × ≤0.40%) plus slippage, whatever the minSpreadBps slider says. */
 const LIVE_MIN_TAKE_PROFIT_BPS = 120
+/** 3-leg planning fee per leg: Kraken Pro taker for <10k USD 30-day volume. */
+const LIVE_FEE_BPS_PER_LEG = 40
+/** Minimum NET return of a cycle, after the 3 fees, to send real orders. */
+const LIVE_MIN_NET_PROFIT_BPS = 10
+/** Skip a cycle when any of its 3 books is wider than this (bps). */
+const LIVE_MAX_BOOK_SPREAD_BPS = 30
 
-// Hard safety gate: the current repository does NOT yet implement an atomic
-// three-leg Kraken execution with rollback/reconciliation for every leg.
-// Keep LIVE triangular execution disabled until that engine is validated.
+// Master switch for LIVE. With it on, LIVE runs the sequential 3-leg cycle in
+// src/lib/kraken-triangle-live.ts (fill-sized legs, single-order unwind back
+// to USD, halt on any unconfirmed order). Set to false to block real orders.
 const LIVE_TRIANGLE_EXECUTION_ENABLED = true
 
 export interface KrakenConfig {
@@ -129,7 +139,8 @@ export interface KrakenHolding {
 
 export interface KrakenTrade {
   id: string
-  type: 'buy' | 'sell'
+  /** 'cycle' = one complete LIVE 3-leg triangle (USD → … → USD). */
+  type: 'buy' | 'sell' | 'cycle'
   routeId: string
   routeName: string
   token: string
@@ -234,19 +245,6 @@ function buildRaw(
   return raw
 }
 
-async function fetchKrakenPrices(): Promise<Record<string, number> | null> {
-  try {
-    const live = await fetchKrakenTickers(KRAKEN_ASSETS.map((a) => a.symbol))
-    const raw: Record<string, number> = {}
-    for (const a of KRAKEN_ASSETS) {
-      const q = live[a.symbol]
-      raw[a.symbol] = q ? q.last : a.anchorPerQuote
-    }
-    return raw
-  } catch {
-    return null
-  }
-}
 
 /** Direct vs implied divergence in USD. Positive ⇒ cross-implied > direct. */
 function routeSpread(
@@ -311,6 +309,8 @@ export function useKrakenBot() {
   stateRef.current = state
   const loopRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const inFlightRef = useRef(false)
+  /** LIVE: consecutive ticks without fresh Kraken quotes. */
+  const liveFailRef = useRef(0)
   const liveRiskRef = useRef({
     day: new Date().toISOString().slice(0, 10),
     realizedPnl: 0,
@@ -367,10 +367,34 @@ export function useKrakenBot() {
       let raw: Record<string, number>
       let liveData = false
       let liveErr: unknown = null
-      if (cfg.dataMode === 'live') {
-        const liveRaw = await fetchKrakenPrices()
-        if (liveRaw) {
-          raw = liveRaw
+      // Full books (bid/ask) — the 3-leg planner prices legs at ask/bid, not last.
+      let liveTickers: Record<string, KrakenTickerQuote> | null = null
+      if (cfg.liveTrading) {
+        // REAL MONEY: never trade on simulated or months-old anchor prices.
+        // No fresh quotes → skip this tick; 5 in a row → halt.
+        liveTickers = await fetchKrakenTickers(KRAKEN_ASSETS.map((a) => a.symbol)).catch(() => null)
+        if (!liveTickers) {
+          liveFailRef.current += 1
+          if (liveFailRef.current >= 5) {
+            halt(`Kraken API inaccesible ${liveFailRef.current} ciclos seguidos con dinero real — detenido por seguridad`)
+            return
+          }
+          log(`Kraken API no disponible (${liveFailRef.current}/5) — ciclo omitido (sin precios simulados con dinero real)`, 'warn')
+          setState((s) => ({ ...s, status: 'paused' }))
+          return
+        }
+        liveFailRef.current = 0
+        raw = {}
+        for (const a of KRAKEN_ASSETS) {
+          const q = liveTickers[a.symbol]
+          if (q) raw[a.symbol] = q.last
+        }
+        liveData = true
+      } else if (cfg.dataMode === 'live') {
+        liveTickers = await fetchKrakenTickers(KRAKEN_ASSETS.map((a) => a.symbol)).catch(() => null)
+        if (liveTickers) {
+          raw = {}
+          for (const a of KRAKEN_ASSETS) raw[a.symbol] = liveTickers[a.symbol]?.last ?? a.anchorPerQuote
           liveData = true
         } else {
           liveErr = new Error('kraken api unreachable')
@@ -380,7 +404,7 @@ export function useKrakenBot() {
         raw = buildRaw(now, 'mock')
       }
 
-      const rows = buildKrakenRows(raw, null, now, liveData ? 'live' : 'mock')
+      const rows = buildKrakenRows(raw, liveTickers, now, liveData ? 'live' : 'mock')
       const priceHistory: Record<string, number[]> = {}
       for (const a of KRAKEN_ASSETS) {
         const sym = a.symbol
@@ -652,7 +676,141 @@ export function useKrakenBot() {
         }
       }
 
-      // 3. BUY logic — paper strategy. LIVE is hard-gated until the 3-leg executor is validated.
+      // 3a. LIVE — full 3-leg triangle cycle (USD → … → USD in one tick).
+      if (cfg.liveTrading && cred && liveTickers) {
+        const risk = liveRiskRef.current
+        const today = new Date().toISOString().slice(0, 10)
+        if (risk.day !== today) {
+          risk.day = today
+          risk.realizedPnl = 0
+          risk.consecutiveLosses = 0
+        }
+        if (risk.realizedPnl <= -LIVE_MAX_DAILY_LOSS_USD) {
+          halt(`límite diario alcanzado: ${risk.realizedPnl.toFixed(2)} USD`)
+          return
+        }
+        if (risk.consecutiveLosses >= LIVE_MAX_CONSECUTIVE_LOSSES) {
+          halt(`${risk.consecutiveLosses} pérdidas consecutivas; revisión manual requerida`)
+          return
+        }
+        const cooling = Date.now() - risk.lastOrderAt < LIVE_COOLDOWN_MS
+        // Size from the REAL free USD, minus room for fee + slippage, and
+        // never above the per-order cap or the capital the user set.
+        const spendable = cash * (1 - LIVE_FUNDS_BUFFER)
+        const notional = Math.min(cfg.budgetPerTradeUsd, LIVE_MAX_ORDER_USD, cfg.capitalUsd, spendable)
+        if (!cooling && notional < LIVE_MIN_ORDER_USD) {
+          halt(
+            `saldo USD insuficiente para operar: ${cash.toFixed(2)} USD libres, capital ${cfg.capitalUsd.toFixed(2)} USD. ` +
+              'Un ciclo de 3 patas necesita superar el mínimo de Kraken en cada par (≈10 USD o más).'
+          )
+          return
+        }
+
+        // Plan every route on the live books; keep only cycles that clear the
+        // three taker fees with margin.
+        const books: Record<string, TrianglePairBook> = {}
+        for (const [sym, q] of Object.entries(liveTickers)) books[sym] = { bid: q.bid, ask: q.ask }
+        const candidates: { plan: CyclePlan; route: KrakenTriangleRoute; inter: string }[] = []
+        let best: CyclePlan | null = null
+        for (const route of KRAKEN_TRIANGLES) {
+          const inter = KRAKEN_ASSETS.find((a) => a.symbol === route.usdtSymbol)?.base ?? 'X'
+          const plan = planTriangleCycle(route, inter, books, notional, LIVE_FEE_BPS_PER_LEG)
+          if (!plan) continue
+          if (!best || plan.netBps > best.netBps) best = plan
+          if (plan.netBps >= LIVE_MIN_NET_PROFIT_BPS && plan.netProfitUsd > 0) {
+            candidates.push({ plan, route, inter })
+          }
+        }
+        candidates.sort((a, b) => b.plan.netBps - a.plan.netBps)
+
+        if (candidates.length === 0) {
+          if (best && s0.stats && s0.stats.scanCount % 6 === 0) {
+            log(
+              `3-leg: sin ciclo rentable — mejor ${best.routeName} ${best.netBps.toFixed(0)}bps netos ` +
+                `(bruto ${best.grossBps.toFixed(0)}bps − 3×${LIVE_FEE_BPS_PER_LEG}bps comisión; necesita ≥ ${LIVE_MIN_NET_PROFIT_BPS})`,
+              'info'
+            )
+          }
+        } else if (!cooling) {
+          // One cycle per tick: each leg re-reads its fill before the next one.
+          const { plan, route, inter } = candidates[0]
+          const path = cyclePathLabel(plan, inter)
+          log(
+            `3-leg ${path} en ${route.name}: plan +${plan.netBps.toFixed(1)}bps netos sobre ${fmtUsdKraken(plan.notionalUsd, 2)} USD — ejecutando`,
+            'trade'
+          )
+          setState((s) => ({ ...s, status: 'executing' }))
+          const outcome = await executeLiveTriangle(plan, route, {
+            cred,
+            tickers: liveTickers,
+            maxBookSpreadBps: LIVE_MAX_BOOK_SPREAD_BPS,
+          })
+          if (outcome.kind === 'fatal') {
+            halt(outcome.reason)
+            return
+          }
+          if (outcome.kind === 'skip') {
+            log(`⏭ ${route.name}: ${outcome.reason}`, 'warn')
+          } else {
+            const pnl = outcome.netProfitUsd
+            const legs = outcome.kind === 'done' ? outcome.legs : [...outcome.legs, outcome.unwind]
+            const legText = legs
+              .map((l) => `${l.side === 'buy' ? 'B' : 'S'}:${l.pair}@${l.price.toPrecision(6)}`)
+              .join(' → ')
+            trades.unshift({
+              id: `krt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+              type: 'cycle',
+              routeId: route.id,
+              routeName: route.name,
+              token: route.token,
+              priceUsd: legs[0].price,
+              notionalUsd: plan.notionalUsd,
+              pnlUsd: pnl,
+              profitBps: Math.round((pnl / plan.notionalUsd) * 10000),
+              reason:
+                outcome.kind === 'done'
+                  ? `${path} [real] ${legText}`
+                  : `${path} DESHECHO [real]: ${outcome.reason} — ${legText}`,
+              status: 'filled',
+              createdAt: now,
+            })
+            opps.unshift({
+              id: `krp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+              routeId: route.id,
+              name: route.name,
+              side: plan.direction,
+              buyPrice: legs[0].price,
+              sellPrice: legs[legs.length - 1].price,
+              spreadBps: Math.round(plan.grossBps),
+              notionalUsd: plan.notionalUsd,
+              profitUsd: pnl,
+              detectedAt: now,
+              executed: true,
+            })
+            risk.realizedPnl += pnl
+            risk.consecutiveLosses = pnl < 0 ? risk.consecutiveLosses + 1 : 0
+            realTrades++
+            log(
+              outcome.kind === 'done'
+                ? `LIVE 3-LEG ${path} ${pnl >= 0 ? '+' : ''}${fmtUsdKraken(pnl, 4)} USD (comisiones ${fmtUsdKraken(outcome.feeTotalUsd, 4)}) — ${legText}`
+                : `LIVE 3-LEG DESHECHO ${path}: ${outcome.reason} → ${pnl >= 0 ? '+' : ''}${fmtUsdKraken(pnl, 4)} USD`,
+              outcome.kind === 'done' ? 'trade' : 'warn'
+            )
+          }
+          // Any attempt that reached Kraken starts the cooldown.
+          risk.lastOrderAt = Date.now()
+          if (risk.realizedPnl <= -LIVE_MAX_DAILY_LOSS_USD) {
+            halt(`límite diario alcanzado: P&L real ${risk.realizedPnl.toFixed(2)} USD`)
+            return
+          }
+          if (risk.consecutiveLosses >= LIVE_MAX_CONSECUTIVE_LOSSES) {
+            halt(`${risk.consecutiveLosses} ciclos reales con pérdida seguidos; revisión manual requerida`)
+            return
+          }
+        }
+      }
+
+      // 3. BUY logic — PAPER strategy only (LIVE runs the 3-leg cycle above).
       const openBefore = holdings.filter((h) => h.status === 'open')
       const investedBefore = openBefore.reduce((a, h) => a + h.notionalUsd, 0)
       const equityBefore = cash + investedBefore
@@ -660,7 +818,7 @@ export function useKrakenBot() {
       const compoundFactor = cfg.compound ? Math.max(equityBefore, 1) / Math.max(cfg.capitalUsd, 1) : 1
       const openCount = openBefore.length
       let buys = 0
-      for (const route of KRAKEN_TRIANGLES) {
+      for (const route of cfg.liveTrading ? [] : KRAKEN_TRIANGLES) {
         if (openCount + buys >= cfg.maxHoldings) break
         const s = routeSpread(route, raw)
         if (!s) continue
@@ -679,149 +837,6 @@ export function useKrakenBot() {
         const buyPrice = crossCheap ? s.impliedUsd : s.directUsd
         const sellPrice = crossCheap ? s.directUsd : s.impliedUsd
         const profitUsd = ((sellPrice - buyPrice) / buyPrice) * notional
-
-        // LIVE: Kraken sizes orders in the BASE asset, so the USD notional has
-        // to be converted with the live quote and the pair minimums respected.
-        // Execution always happens on the USD leg of the route, which keeps
-        // the position a single asset denominated in USD.
-        if (cfg.liveTrading && cred) {
-          // This implementation places a REAL position only on the direct USD pair.
-          // If the cross route is the cheap leg, executing only the direct leg would
-          // NOT be triangular arbitrage, so it is deliberately skipped.
-          if (crossCheap) {
-            log(`⏭ ${route.name}: señal cross-cheap omitida en LIVE; requiere ejecución multi-leg atómica`, 'warn')
-            continue
-          }
-
-          if (spread < LIVE_MIN_SIGNAL_BPS) continue
-
-          const risk = liveRiskRef.current
-          const today = new Date().toISOString().slice(0, 10)
-          if (risk.day !== today) {
-            risk.day = today
-            risk.realizedPnl = 0
-            risk.consecutiveLosses = 0
-          }
-          if (risk.realizedPnl <= -LIVE_MAX_DAILY_LOSS_USD) {
-            halt(`límite diario alcanzado: ${risk.realizedPnl.toFixed(2)} USD`)
-            return
-          }
-          if (risk.consecutiveLosses >= LIVE_MAX_CONSECUTIVE_LOSSES) {
-            halt(`${risk.consecutiveLosses} pérdidas consecutivas; revisión manual requerida`)
-            return
-          }
-          if (Date.now() - risk.lastOrderAt < LIVE_COOLDOWN_MS) {
-            continue
-          }
-
-          // Re-read Kraken immediately before every real BUY.
-          let realUsdFree = 0
-          try {
-            realUsdFree = krakenUsdFree(await krakenGetBalances(cred))
-          } catch (e) {
-            halt(`no se pudo comprobar el saldo real antes de BUY: ${(e as Error).message}`)
-            return
-          }
-          // A market BUY needs volume × ask + taker fee (fciq) + slippage.
-          // Sizing at 100% of the free USD with the LAST price is what made
-          // Kraken answer EOrder:Insufficient funds.
-          const spendable = realUsdFree * (1 - LIVE_FUNDS_BUFFER)
-          // Never let the configurable/paper budget become a large real order,
-          // and never spend more than the capital the user set for live mode.
-          const liveNotional = Math.min(notional, LIVE_MAX_ORDER_USD, cfg.capitalUsd, spendable)
-          if (liveNotional < LIVE_MIN_ORDER_USD) {
-            halt(
-              `saldo USD insuficiente para operar: ${realUsdFree.toFixed(2)} USD libres, capital ${cfg.capitalUsd.toFixed(2)} USD. ` +
-                `Kraken exige ~${LIVE_MIN_ORDER_USD} USD mínimo por orden y la mayoría de pares piden más (ETH ≈ 0.001, SOL ≈ 0.06).`
-            )
-            return
-          }
-
-          const pair = route.directSymbol
-          const price = raw[pair] ?? 0
-          if (!(price > 0)) {
-            halt(`sin precio en vivo para ${pair}; no se puede dimensionar la orden`)
-            return
-          }
-          const filters = await krakenOrderFilters(pair).catch(() => null)
-          const lot = filters ? krakenRoundVolume(liveNotional / price, filters) : liveNotional / price
-          if (filters && (filters.costmin > 0 && liveNotional < filters.costmin ||
-                          filters.ordermin > 0 && lot < filters.ordermin)) {
-            log(
-              `⏭ ${route.name}: ${fmtUsdKraken(liveNotional, 2)} USD / ${lot} ${route.token} por debajo del mínimo de Kraken (${filters.costmin} USD / ${filters.ordermin}) — se omite`,
-              'warn'
-            )
-            continue
-          }
-          if (!(lot > 0)) continue
-          let order
-          try {
-            order = await krakenMarketOrder({ cred, pair, side: 'buy', volume: lot })
-          } catch (e) {
-            halt(`orden BUY ${pair} rechazada: ${(e as Error).message}`)
-            return
-          }
-          if (order.executedQty <= 0) {
-            halt(`orden BUY ${pair} sin fills (${order.orderId})`)
-            return
-          }
-          // fciq: the fee is charged in USD on top of the cost.
-          const spent = order.executedQuote + (order.feeQuote ?? 0)
-          const fillPrice = order.price
-          holdings.unshift({
-            id: `krh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-            routeId: route.id,
-            routeName: route.name,
-            token: route.token,
-            side: crossCheap ? 'cross_cheap' : 'direct_cheap',
-            buyPrice: fillPrice,
-            currentPrice: fillPrice,
-            peakPrice: fillPrice,
-            notionalUsd: spent,
-            status: 'open',
-            boughtAt: now,
-            realBaseQty: order.executedQty,
-            realQuoteUsd: spent,
-            realOrderId: order.orderId,
-            realPair: pair,
-          })
-          trades.unshift({
-            id: `krt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-            type: 'buy',
-            routeId: route.id,
-            routeName: route.name,
-            token: route.token,
-            priceUsd: fillPrice,
-            notionalUsd: spent,
-            pnlUsd: 0,
-            profitBps: s.spreadBps,
-            reason: `Divergence ${route.token}: ${s.directUsd.toFixed(6)} vs ${s.impliedUsd.toFixed(6)} (${s.spreadBps >= 0 ? '+' : ''}${s.spreadBps}bps) [real]`,
-            status: 'filled',
-            createdAt: now,
-          })
-          opps.unshift({
-            id: `krp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-            routeId: route.id,
-            name: route.name,
-            side: crossCheap ? 'cross_cheap' : 'direct_cheap',
-            buyPrice: fillPrice,
-            sellPrice,
-            spreadBps: s.spreadBps,
-            notionalUsd: spent,
-            profitUsd,
-            detectedAt: now,
-            executed: true,
-          })
-          cash -= spent
-          buys++
-          liveRiskRef.current.lastOrderAt = Date.now()
-          realTrades++
-          log(
-            `LIVE BUY ${pair} ${order.executedQty} @ ${fillPrice.toFixed(6)} — ${fmtUsdKraken(spent, 2)} USD (${s.spreadBps >= 0 ? '+' : ''}${s.spreadBps}bps)`,
-            'trade'
-          )
-          continue
-        }
 
         holdings.unshift({
           id: `krh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -887,9 +902,13 @@ export function useKrakenBot() {
       const invested = open.reduce((a, h) => a + h.notionalUsd, 0)
       const equity = cash + invested
       const sold = holdings.filter((h) => h.status === 'sold')
-      const realized = sold.reduce((a, h) => a + (h.pnlUsd ?? 0), 0)
-      const wins = sold.filter((h) => (h.pnlUsd ?? 0) >= 0).length
-      const total = sold.length
+      // LIVE 3-leg cycles close in the same tick: they never become holdings.
+      const cycles = trades.filter((t) => t.type === 'cycle')
+      const realized =
+        sold.reduce((a, h) => a + (h.pnlUsd ?? 0), 0) + cycles.reduce((a, t) => a + t.pnlUsd, 0)
+      const wins =
+        sold.filter((h) => (h.pnlUsd ?? 0) >= 0).length + cycles.filter((t) => t.pnlUsd >= 0).length
+      const total = sold.length + cycles.length
       const prevStats = stateRef.current.stats
       const stats: KrakenStats = {
         running: s0.enabled,
