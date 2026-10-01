@@ -66,7 +66,7 @@ export function SeabotHeader({ seabot }: SeabotHeaderProps) {
               SeaBot
             </h1>
             <p className="hidden text-[11px] text-muted-foreground sm:block">
-              NFT buy-low / sell-high &middot; mock floor engine &middot; fictional ETH
+              NFT buy-low / sell-high &middot; {seabot.config.dataMode === 'live' ? 'floors reales de OpenSea' : 'SIMULACIÓN (floors sintéticos)'} &middot; fictional ETH
             </p>
           </div>
         </div>

@@ -241,7 +241,7 @@ export function SeabotTradingPanel({ seabot }: SeabotTradingPanelProps) {
             </CardTitle>
             <CardDescription className="mt-1">
               NFT buy-low / sell-high &middot; fictional ETH &middot;{' '}
-              <span className="text-cyan-400">mock floor engine</span>
+              <span className="text-cyan-400">{seabot.config.dataMode === 'live' ? 'floors reales de OpenSea' : 'SIMULACIÓN (floors sintéticos)'}</span>
             </CardDescription>
           </div>
           <StatusBadge status={seabot.status} />
@@ -351,13 +351,13 @@ export function SeabotTradingPanel({ seabot }: SeabotTradingPanelProps) {
           <StatTile
             label="Realized P&L"
             value={fmtEth(realized)}
-            sub={`${fmtEthUsd(realized, ETH_USD_PRICE)}`}
+            sub={`${fmtEthUsd(realized, seabot.ethUsd)}`}
             tone={pnlTone}
           />
           <StatTile
             label="Cash Balance"
             value={fmtEth(seabot.cashEth)}
-            sub={`${fmtEthUsd(seabot.cashEth, ETH_USD_PRICE)}`}
+            sub={`${fmtEthUsd(seabot.cashEth, seabot.ethUsd)}`}
             tone="positive"
           />
           <StatTile

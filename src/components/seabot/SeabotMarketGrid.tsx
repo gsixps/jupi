@@ -21,7 +21,6 @@ import {
 } from '@/components/ui/table'
 import { Badge } from '@/components/ui/badge'
 import { fmtEth, fmtEthUsd } from '@/lib/format'
-import { ETH_USD_PRICE } from '@/lib/seabot'
 import type { useSeabot } from '@/hooks/use-seabot'
 
 interface SeabotMarketGridProps {
@@ -101,7 +100,7 @@ export function SeabotMarketGrid({ seabot }: SeabotMarketGridProps) {
           <div>
             <CardTitle className="text-base">NFT Floor Prices</CardTitle>
             <CardDescription className="mt-1">
-              Watchlist &middot; {rows.length} collections &middot; mock floor engine
+              Watchlist &middot; {rows.length} collections &middot; {seabot.config.dataMode === 'live' ? 'floors reales de OpenSea' : 'SIMULACIÓN (floors sintéticos)'} &middot; ETH {seabot.ethUsd.toFixed(0)} USD
             </CardDescription>
           </div>
         </div>
@@ -136,7 +135,7 @@ export function SeabotMarketGrid({ seabot }: SeabotMarketGridProps) {
                       {fmtEth(r.floor)}
                     </TableCell>
                     <TableCell className="py-2 text-right tabular-nums text-muted-foreground">
-                      {fmtEthUsd(r.floor, ETH_USD_PRICE)}
+                      {fmtEthUsd(r.floor, seabot.ethUsd)}
                     </TableCell>
                     <TableCell className="py-2 text-right tabular-nums text-cyan-300">
                       {fmtEth(r.maxBuy)}

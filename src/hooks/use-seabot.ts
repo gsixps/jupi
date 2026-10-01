@@ -9,9 +9,11 @@
 //      capacity / capital-tier allows.
 //   4. Update portfolio stats + log everything.
 //
-// Capital is FICTIONAL (ETH). Market data = deterministic mock floor engine
-// (the seabot project's demo data layer, without an OpenSea API key). No real
-// on-chain trades are executed.
+// Capital is FICTIONAL (ETH). Market data = REAL OpenSea floors and sales via
+// /api/opensea (needs OPENSEA_API_KEY on the server). Buys pay gas; sales pay
+// the OpenSea fee, the creator fee and gas, and only fill on collections with
+// real recent sales. The synthetic floor engine runs only in the explicit
+// simulation data mode. No real on-chain trades are executed.
 
 'use client'
 
@@ -22,6 +24,12 @@ import {
   mockTokenId,
   DEFAULT_SEABOT_CONFIG,
   ETH_USD_PRICE,
+  MIN_DAILY_SALES_TO_SELL,
+  OPENSEA_MARKET_FEE_PCT,
+  fetchEthUsd,
+  fetchOpenSeaCollections,
+  nftGasUsd,
+  type OpenSeaCollectionData,
 } from '@/lib/seabot'
 import type {
   SeabotCollection,
@@ -49,6 +57,8 @@ export interface SeabotState {
   logs: SeabotLogEntry[]
   status: 'idle' | 'scanning' | 'executing' | 'paused'
   priceHistory: Record<string, number[]>
+  /** live ETH/USD (falls back to the static ETH_USD_PRICE until fetched) */
+  ethUsd: number
 }
 
 export function useSeabot() {
@@ -88,6 +98,7 @@ export function useSeabot() {
       logs: [],
       status: 'idle',
       priceHistory,
+      ethUsd: ETH_USD_PRICE,
     }
   })
 
@@ -117,52 +128,95 @@ export function useSeabot() {
       const now = Date.now()
       const cfg = s0.config
 
-      // 1. Refresh floor prices
-      const collections = s0.collections.map((c) => ({
-        ...c,
-        floorPrice: mockFloorPrice(c.slug, c.baseFloor, now),
-      }))
+      // 1. Floors — REAL OpenSea data (server proxy) or the explicit
+      // simulation. With real data an unreachable API skips the tick.
+      let ethUsd = stateRef.current.ethUsd
+      let market: Record<string, OpenSeaCollectionData> | null = null
+      if (cfg.dataMode === 'live') {
+        try {
+          const watched = s0.collections.filter((c) => c.watch).map((c) => c.slug)
+          const [m, px] = await Promise.all([
+            fetchOpenSeaCollections(watched),
+            fetchEthUsd().catch(() => 0),
+          ])
+          market = m
+          if (px > 0) ethUsd = px
+        } catch (e) {
+          log(`OpenSea no disponible (${(e as Error).message}) — ciclo omitido, sin precios simulados`, 'warn')
+          setState((s) => ({ ...s, status: 'paused' }))
+          return
+        }
+      }
+      const collections = s0.collections.map((c) => {
+        if (!market) {
+          return { ...c, floorPrice: mockFloorPrice(c.slug, c.baseFloor, now), live: false }
+        }
+        const d = market[c.slug]
+        const ethFloor = !!d && d.ok && /^W?ETH$/i.test(d.floorSymbol)
+        const avg7d = d && d.sevenDaySales > 0 ? d.sevenDayVolume / d.sevenDaySales : 0
+        return {
+          ...c,
+          floorPrice: ethFloor ? d.floorEth : 0,
+          oneDayVolume: d?.oneDayVolume ?? 0,
+          oneDaySales: d?.oneDaySales ?? 0,
+          avg7dEth: avg7d,
+          chain: d?.chain ?? 'ethereum',
+          creatorFeePct: d?.creatorFeePct ?? 0,
+          // buy only on a real dip below the 7-day average sale price
+          maxBuyPrice: avg7d > 0 ? avg7d * (1 - cfg.dipPct / 100) : 0,
+          live: ethFloor,
+          dataError: !d ? 'sin datos' : !d.ok ? d.error ?? 'sin floor' : !ethFloor ? `floor en ${d.floorSymbol}` : undefined,
+        }
+      })
       const priceHistory: Record<string, number[]> = {}
       for (const c of collections) {
+        if (!(c.floorPrice > 0)) continue
         const arr = [...(s0.priceHistory[c.slug] ?? []), c.floorPrice]
         if (arr.length > PRICE_HISTORY_CAP) arr.splice(0, arr.length - PRICE_HISTORY_CAP)
         priceHistory[c.slug] = arr
       }
-      setState((s) => ({ ...s, collections, priceHistory }))
+      setState((s) => ({ ...s, collections, priceHistory, ethUsd }))
+      const gasEth = (chain?: string) => (ethUsd > 0 ? nftGasUsd(chain ?? 'ethereum') / ethUsd : 0)
 
       let cash = stateRef.current.cashEth
       const holdings = stateRef.current.holdings.map((h) => ({ ...h }))
       const trades = [...stateRef.current.trades]
 
+      /** Proceeds of selling at `floor`: marketplace + creator fees and gas. */
+      const netSale = (col: (typeof collections)[number], floor: number) =>
+        floor * (1 - (OPENSEA_MARKET_FEE_PCT + (col.creatorFeePct ?? 0)) / 100) - gasEth(col.chain)
+
       const sellHolding = (
         h: SeabotHolding,
-        sellPrice: number,
+        col: (typeof collections)[number],
+        floor: number,
         reason: string,
         level: SeabotLogEntry['level'],
         detail: string
       ) => {
-        const pnl = sellPrice - h.buyPriceEth
+        const proceeds = netSale(col, floor)
+        const pnl = proceeds - h.buyPriceEth
         h.status = 'sold'
         h.soldAt = now
-        h.sellPriceEth = sellPrice
+        h.sellPriceEth = proceeds
         h.pnlEth = pnl
-        cash += sellPrice
+        cash += proceeds
         trades.unshift({
           id: `sbt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           type: 'sell',
           collectionSlug: h.collectionSlug,
           collectionName: h.collectionName,
           tokenId: h.tokenId,
-          priceEth: sellPrice,
+          priceEth: proceeds,
           pnlEth: pnl,
-          reason,
+          reason: `${reason} · neto tras comisiones y gas`,
           status: 'filled',
           createdAt: now,
         })
         const prefix =
           detail === 'stop-loss' ? 'STOP-LOSS' : detail === 'trailing-stop' ? 'TRAILING' : 'VENDIDO'
         log(
-          `${prefix} ${h.collectionName} ${h.tokenId} @ ${sellPrice.toFixed(4)} ETH (${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} ETH)`,
+          `${prefix} ${h.collectionName} ${h.tokenId} @ floor ${floor.toFixed(4)} → neto ${proceeds.toFixed(4)} ETH (${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} ETH)`,
           level
         )
         if (cfg.compound) {
@@ -173,55 +227,50 @@ export function useSeabot() {
         }
       }
 
-      // 2. SELL logic — iterate open holdings
+      // 2. SELL logic — targets are measured on what a sale would NET.
       for (const h of holdings) {
         if (h.status !== 'open') continue
         const col = collections.find((c) => c.slug === h.collectionSlug)
-        if (!col) continue
+        if (!col || !(col.floorPrice > 0)) continue
         const curFloor = col.floorPrice
+        const net = netSale(col, curFloor)
+        h.currentPriceEth = net
         const target = h.buyPriceEth * (1 + col.targetProfitPct / 100)
         const stop = h.buyPriceEth * (1 - col.stopLossPct / 100)
-
-        if (curFloor >= target) {
-          sellHolding(
-            h,
-            curFloor,
-            `Take profit +${col.targetProfitPct}% (target ${target.toFixed(4)} ETH)`,
-            'trade',
-            'take-profit'
-          )
-        } else if (curFloor <= stop) {
-          sellHolding(
-            h,
-            curFloor,
-            `Stop loss -${col.stopLossPct}% (stop ${stop.toFixed(4)} ETH)`,
-            'warn',
-            'stop-loss'
-          )
+        let exit: { reason: string; level: SeabotLogEntry['level']; detail: string } | null = null
+        if (net >= target) {
+          exit = { reason: `Take profit +${col.targetProfitPct}%`, level: 'trade', detail: 'take-profit' }
+        } else if (net <= stop) {
+          exit = { reason: `Stop loss -${col.stopLossPct}%`, level: 'warn', detail: 'stop-loss' }
         } else if (
           cfg.trailingStopPct > 0 &&
           h.peakPriceEth > 0 &&
-          curFloor <= h.peakPriceEth * (1 - cfg.trailingStopPct / 100)
+          net <= h.peakPriceEth * (1 - cfg.trailingStopPct / 100)
         ) {
-          sellHolding(
-            h,
-            curFloor,
-            `Trailing stop -${cfg.trailingStopPct}% from peak ${h.peakPriceEth.toFixed(4)} ETH`,
-            'trade',
-            'trailing-stop'
-          )
-        } else {
-          h.currentPriceEth = curFloor
-          h.peakPriceEth = Math.max(h.peakPriceEth || h.buyPriceEth, curFloor)
+          exit = { reason: `Trailing stop -${cfg.trailingStopPct}%`, level: 'trade', detail: 'trailing-stop' }
         }
+        if (!exit) {
+          h.peakPriceEth = Math.max(h.peakPriceEth || h.buyPriceEth, net)
+          continue
+        }
+        // A listing only fills if the collection is actually trading.
+        if (col.live && (col.oneDaySales ?? 0) < MIN_DAILY_SALES_TO_SELL) {
+          log(
+            `⏳ ${h.collectionName} ${h.tokenId}: ${exit.reason}, pero solo ${col.oneDaySales ?? 0} ventas en 24 h — sin compradores, se mantiene`,
+            'warn'
+          )
+          continue
+        }
+        sellHolding(h, col, curFloor, exit.reason, exit.level, exit.detail)
       }
 
-      // 3. BUY logic
+      // 3. BUY logic — floor at a real dip below the 7-day average sale,
+      // on collections that trade enough to exit later.
       const openCount = holdings.filter((h) => h.status === 'open').length
       const investedEth = holdings
         .filter((h) => h.status === 'open')
         .reduce((a, h) => a + h.currentPriceEth, 0)
-      const totalCapitalUsd = (cash + investedEth) * ETH_USD_PRICE
+      const totalCapitalUsd = (cash + investedEth) * (ethUsd || ETH_USD_PRICE)
       // Compound interest: scale per-trade budget with grown capital
       const compoundFactor = cfg.compound
         ? Math.max(cash + investedEth, 0.001) / Math.max(cfg.capitalEth, 0.001)
@@ -233,21 +282,23 @@ export function useSeabot() {
         if (openCount + buys >= cfg.maxHoldings) break
         if (c.floorPrice <= 0) continue
         if (totalCapitalUsd < c.minCapitalUsd) continue
+        if (holdings.some((h) => h.status === 'open' && h.collectionSlug === c.slug)) continue
+        if (c.live && (c.oneDaySales ?? 0) < MIN_DAILY_SALES_TO_SELL) continue
 
+        const cost = c.floorPrice + gasEth(c.chain)
         const spend = Math.min(cfg.budgetPerTradeEth * compoundFactor, cash)
-        if (spend < c.floorPrice) continue
-        if (c.floorPrice > c.maxBuyPrice) continue
+        if (spend < cost) continue
+        if (!(c.maxBuyPrice > 0) || c.floorPrice > c.maxBuyPrice) continue
 
         const tokenId = mockTokenId(c.slug, now)
-        const buyPrice = c.floorPrice
         holdings.unshift({
           id: `sbh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           collectionSlug: c.slug,
           collectionName: c.name,
           tokenId,
-          buyPriceEth: buyPrice,
-          currentPriceEth: buyPrice,
-          peakPriceEth: buyPrice,
+          buyPriceEth: cost,
+          currentPriceEth: netSale(c, c.floorPrice),
+          peakPriceEth: netSale(c, c.floorPrice),
           status: 'open',
           boughtAt: now,
         })
@@ -257,15 +308,18 @@ export function useSeabot() {
           collectionSlug: c.slug,
           collectionName: c.name,
           tokenId,
-          priceEth: buyPrice,
+          priceEth: cost,
           pnlEth: 0,
-          reason: `Floor ${buyPrice.toFixed(4)} ≤ max ${c.maxBuyPrice.toFixed(4)} ETH`,
+          reason: `Floor ${c.floorPrice.toFixed(4)} ≤ ${c.maxBuyPrice.toFixed(4)} ETH (−${cfg.dipPct}% vs media 7 d) + gas`,
           status: 'filled',
           createdAt: now,
         })
-        cash -= buyPrice
+        cash -= cost
         buys++
-        log(`COMPRADO ${c.name} ${tokenId} @ ${buyPrice.toFixed(4)} ETH`, 'trade')
+        log(
+          `COMPRADO ${c.name} ${tokenId} @ ${c.floorPrice.toFixed(4)} ETH + gas${c.live ? '' : ' [simulación]'}`,
+          'trade'
+        )
       }
 
       // 4. Stats
@@ -314,9 +368,6 @@ export function useSeabot() {
         status: 'scanning',
       }))
 
-      if (buys === 0 && sold.length === 0) {
-        log(`Sin oportunidades de operación este ciclo — ${collections.length} colecciones escaneadas`, 'info')
-      }
     } finally {
       inFlightRef.current = false
     }
@@ -330,7 +381,7 @@ export function useSeabot() {
       stats: s.stats ? { ...s.stats, running: true } : s.stats,
     }))
     log(
-      `SEABOT iniciado — ${stateRef.current.config.capitalEth.toFixed(2)} ETH ficticios, motor de floors mock`,
+      `SEABOT iniciado — ${stateRef.current.config.capitalEth.toFixed(2)} ETH ficticios, ${stateRef.current.config.dataMode === 'live' ? 'floors reales de OpenSea' : 'SIMULACIÓN (floors sintéticos)'}`,
       'trade'
     )
     if (loopRef.current) clearInterval(loopRef.current)

@@ -7,9 +7,9 @@
 //     trailing-stop) → BUY (floor ≤ max buy price, budget/capacity allows).
 //   - Fictional ETH capital, every P&L figure computed at the market rate.
 //
-// Market data layer: deterministic mock engine (sine waves + noise bucket),
-// identical to the seabot project's demo mode when no OpenSea API key is set.
-// The engine is pure (no I/O) so it runs in the browser.
+// Market data layer: REAL OpenSea floors and sales through the server proxy
+// /api/opensea (the API key stays on the server). The deterministic mock
+// engine below only runs in the explicit SIMULATION data mode.
 
 export const ETH_USD_PRICE = 3247.18
 
@@ -90,6 +90,13 @@ export interface SeabotCollection {
   maxBuyPrice: number
   targetProfitPct: number
   stopLossPct: number
+  // REAL data (OpenSea) — absent in simulation mode
+  oneDaySales?: number
+  avg7dEth?: number
+  chain?: string
+  creatorFeePct?: number
+  live?: boolean
+  dataError?: string
 }
 
 export interface SeabotHolding {
@@ -137,6 +144,11 @@ export interface SeabotConfig {
   compound: boolean // reinvest profits → per-trade budget scales with equity
   /** Buy/sell real NFTs on-chain with a connected wallet and real ETH. */
   liveTrading: boolean
+  /** 'live' = real OpenSea floors/sales (needs OPENSEA_API_KEY on the
+   *  server); 'mock' = explicit SIMULATION with synthetic floors. */
+  dataMode: 'live' | 'mock'
+  /** Buy when the floor is at least this % below the 7-day average sale. */
+  dipPct: number
 }
 
 export const DEFAULT_SEABOT_CONFIG: SeabotConfig = {
@@ -149,6 +161,8 @@ export const DEFAULT_SEABOT_CONFIG: SeabotConfig = {
   tickIntervalMs: 8000,
   compound: true,
   liveTrading: false,
+  dataMode: 'live',
+  dipPct: 5,
 }
 
 export interface SeabotStats {
@@ -179,3 +193,61 @@ export function mockTokenId(slug: string, t: number): string {
   const n = Math.floor(seededRandom(seed + 't') * 9999)
   return `${name}-${n}`
 }
+// ---- REAL market data (OpenSea via the server proxy /api/opensea) ----
+
+export interface OpenSeaCollectionData {
+  ok: boolean
+  error?: string
+  floorEth: number
+  floorSymbol: string
+  oneDaySales: number
+  oneDayVolume: number
+  sevenDaySales: number
+  sevenDayVolume: number
+  chain: string
+  creatorFeePct: number
+}
+
+/** Live floors + sales for many collections. Throws with OpenSea's/the
+ *  proxy's message when unavailable (e.g. no OPENSEA_API_KEY). */
+export async function fetchOpenSeaCollections(
+  slugs: string[]
+): Promise<Record<string, OpenSeaCollectionData>> {
+  const res = await fetch(`/api/opensea?slugs=${encodeURIComponent(slugs.join(','))}`, {
+    cache: 'no-store',
+  })
+  const j = (await res.json().catch(() => ({}))) as {
+    collections?: Record<string, OpenSeaCollectionData>
+    error?: string
+  }
+  if (!res.ok || !j.collections) throw new Error(j.error ?? `OpenSea proxy ${res.status}`)
+  return j.collections
+}
+
+/** Live ETH/USD (Binance public ticker). */
+export async function fetchEthUsd(): Promise<number> {
+  const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT', {
+    cache: 'no-store',
+  })
+  if (!res.ok) throw new Error(`ETH price ${res.status}`)
+  const p = parseFloat(((await res.json()) as { price: string }).price)
+  if (!(p > 0)) throw new Error('ETH price invalid')
+  return p
+}
+
+/** OpenSea marketplace fee charged to the SELLER, in percent (assumption;
+ *  creator fees come from the collection itself). */
+export const OPENSEA_MARKET_FEE_PCT = 1
+
+/** Rough gas of ONE NFT purchase or sale, in USD, per chain. */
+export const NFT_GAS_USD: Record<string, number> = {
+  ethereum: 3,
+  matic: 0.02,
+  polygon: 0.02,
+  base: 0.05,
+  arbitrum: 0.05,
+}
+export const nftGasUsd = (chain: string) => NFT_GAS_USD[chain] ?? 3
+
+/** A sale only counts as fillable when the collection actually trades. */
+export const MIN_DAILY_SALES_TO_SELL = 3
