@@ -185,6 +185,114 @@ export async function binanceMarketOrder(opts: BinanceMarketOrderOpts): Promise<
   }
 }
 
+/** Binance said "status unknown" (5xx) or the request never got an answer:
+ *  the order may or may not exist — never re-send or unwind blindly. */
+export class BinanceOrderUnconfirmedError extends Error {
+  constructor(public symbol: string, detail: string) {
+    super(
+      `orden ${symbol} enviada pero sin confirmar (${detail}). NO la reenvíes: revisa Binance → Órdenes antes de volver a arrancar.`
+    )
+    this.name = "BinanceOrderUnconfirmedError"
+  }
+}
+
+export interface BinanceFill {
+  orderId: string
+  executedQty: number
+  executedQuote: number
+  price: number
+  /** commissions grouped by asset, as reported in `fills[]` */
+  commissions: Record<string, number>
+}
+
+/**
+ * MARKET order sized in BASE volume, for both sides (triangle legs need it on
+ * cross pairs, where quoteOrderQty would be in BTC/ETH). Reads the real
+ * commissions from the FULL response's `fills[]`.
+ */
+export async function binanceMarketOrderBase(
+  cred: ExchangeCredentials,
+  symbol: string,
+  side: "BUY" | "SELL",
+  quantity: number
+): Promise<BinanceFill> {
+  const ts = Date.now()
+  const qs = encodeQuery({
+    symbol,
+    side,
+    type: "MARKET",
+    quantity: flatDecimal(Number(quantity.toFixed(8))),
+    newOrderRespType: "FULL",
+    timestamp: ts,
+  })
+  const signature = await hmacHex(cred.apiSecret, qs, "SHA-256")
+  let res: Response
+  try {
+    res = await fetch(`${BINANCE_REST}/order?${qs}&signature=${signature}`, {
+      method: "POST",
+      headers: { "X-MBX-APIKEY": cred.apiKey, "Content-Type": "application/x-www-form-urlencoded" },
+    })
+  } catch (e) {
+    throw new BinanceOrderUnconfirmedError(symbol, `sin respuesta: ${(e as Error).message}`)
+  }
+  if (res.status >= 500) {
+    throw new BinanceOrderUnconfirmedError(symbol, `Binance ${res.status}: estado desconocido`)
+  }
+  if (!res.ok) {
+    const t = await res.text()
+    throw new Error(`Binance ${res.status}: ${t.slice(0, 240)}`)
+  }
+  const r = (await res.json()) as {
+    orderId: number
+    executedQty: string
+    cummulativeQuoteQty: string
+    fills?: { commission: string; commissionAsset: string }[]
+  }
+  const executedQty = parseFloat(r.executedQty) || 0
+  const executedQuote = parseFloat(r.cummulativeQuoteQty) || 0
+  const commissions: Record<string, number> = {}
+  for (const f of r.fills ?? []) {
+    commissions[f.commissionAsset] = (commissions[f.commissionAsset] ?? 0) + (parseFloat(f.commission) || 0)
+  }
+  return {
+    orderId: String(r.orderId),
+    executedQty,
+    executedQuote,
+    price: executedQty > 0 ? executedQuote / executedQty : 0,
+    commissions,
+  }
+}
+
+/** LOT_SIZE + NOTIONAL filters of a Binance symbol. */
+export async function binanceSymbolFilters(
+  symbol: string
+): Promise<{ base: string; quote: string; ordermin: number; costmin: number; lot: number } | null> {
+  try {
+    const res = await fetch(`https://api.binance.com/api/v3/exchangeInfo?symbol=${symbol}`)
+    if (!res.ok) return null
+    const j = (await res.json()) as {
+      symbols: {
+        baseAsset: string
+        quoteAsset: string
+        filters: { filterType: string; stepSize?: string; minQty?: string; minNotional?: string }[]
+      }[]
+    }
+    const s = j.symbols[0]
+    if (!s) return null
+    const lot = s.filters.find((f) => f.filterType === "LOT_SIZE")
+    const notional = s.filters.find((f) => f.filterType === "NOTIONAL" || f.filterType === "MIN_NOTIONAL")
+    return {
+      base: s.baseAsset,
+      quote: s.quoteAsset,
+      ordermin: parseFloat(lot?.minQty ?? "0") || 0,
+      costmin: parseFloat(notional?.minNotional ?? "0") || 0,
+      lot: parseFloat(lot?.stepSize ?? "0") || 1e-8,
+    }
+  } catch {
+    return null
+  }
+}
+
 /** Smallest tradable increment per symbol (lot size) — used to round SELL qty. */
 export async function binanceLotSize(symbol: string): Promise<number> {
   try {

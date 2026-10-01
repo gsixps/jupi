@@ -34,7 +34,6 @@ import {
   binanceGetBalances,
   binanceLotSize,
   binanceMarketOrder,
-  binanceMinNotional,
   loadCreds,
   type ExchangeBalance,
   type ExchangeCredentials,
@@ -46,8 +45,27 @@ import {
   reconcileLiveState,
   saveLiveSnapshot,
 } from '@/lib/live-state'
+import { planTriangleCycle, cyclePathLabel, type CyclePlan, type TrianglePairBook } from '@/lib/triangle-exec'
+import { executeTriangleCycle } from '@/lib/triangle-live'
+import { binanceVenue, fetchBinanceBooks } from '@/lib/binance-triangle-live'
+import { TAKER_FEE, paperRoundTrip } from '@/lib/paper-fees'
 
 const LIVE_BOT = 'binance'
+
+// 3-LEG TRIANGLE (demo AND live use the same planner, books and fees, so a
+// demo cycle is exactly what the live bot would have done).
+/** Binance spot taker fee per leg, in bps (no BNB discount). */
+const FEE_BPS_PER_LEG = TAKER_FEE.binance * 10000
+/** Minimum NET return of a cycle, after the 3 fees. */
+const MIN_NET_PROFIT_BPS = 10
+/** Skip a cycle when any of its 3 books is wider than this. */
+const MAX_BOOK_SPREAD_BPS = 30
+// LIVE risk controls (not a promise of profitability).
+const LIVE_MAX_CYCLE_USD = 25
+const LIVE_FUNDS_BUFFER = 0.02
+const LIVE_MAX_DAILY_LOSS_USD = 5
+const LIVE_MAX_CONSECUTIVE_LOSSES = 3
+const LIVE_COOLDOWN_MS = 60_000
 
 const PRICE_HISTORY_CAP = 60
 const TRADE_CAP = 200
@@ -106,7 +124,8 @@ export interface BinanceHolding {
 
 export interface BinanceTrade {
   id: string
-  type: 'buy' | 'sell'
+  /** 'cycle' = one complete 3-leg triangle (USDT → … → USDT). */
+  type: 'buy' | 'sell' | 'cycle'
   routeId: string
   routeName: string
   token: string
@@ -268,6 +287,14 @@ export function useBinanceBot() {
   stateRef.current = state
   const loopRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const inFlightRef = useRef(false)
+  /** consecutive ticks without fresh Binance quotes */
+  const liveFailRef = useRef(0)
+  const liveRiskRef = useRef({
+    day: new Date().toISOString().slice(0, 10),
+    realizedPnl: 0,
+    consecutiveLosses: 0,
+    lastOrderAt: 0,
+  })
 
   const log = useCallback((msg: string, level: BinanceLogEntry['level'] = 'info') => {
     setState((s) => ({
@@ -317,18 +344,36 @@ export function useBinanceBot() {
       // 1. Refresh quotes — live Binance API or mock engine
       let rows: BinancePriceRow[]
       let liveData = false
-      let liveErr: unknown = null
-      if (cfg.dataMode === 'live') {
+      // Executable books (bid/ask) for the 3-leg planner.
+      let books: Record<string, TrianglePairBook> | null = null
+      if (cfg.dataMode === 'live' || cfg.liveTrading) {
         try {
-          const live = await fetchBinancePrices()
+          const [live, b] = await Promise.all([
+            fetchBinancePrices(),
+            fetchBinanceBooks(BINANCE_SYMBOLS.map((x) => x.symbol)),
+          ])
           rows = buildRows(now, 'live', live)
+          books = b
           liveData = true
+          liveFailRef.current = 0
         } catch (e) {
-          liveErr = e
-          rows = buildRows(now, 'mock')
+          // REAL prices only: no simulated fallback, in demo or live. Skip the
+          // tick; with real money, halt after 5 in a row.
+          liveFailRef.current += 1
+          if (cfg.liveTrading && liveFailRef.current >= 5) {
+            halt(`Binance API inaccesible ${liveFailRef.current} ciclos seguidos — detenido por seguridad`)
+            return
+          }
+          log(`Binance API no disponible (${(e as Error).message}) — ciclo omitido, sin precios simulados`, 'warn')
+          setState((st) => ({ ...st, status: 'paused' }))
+          return
         }
       } else {
+        // Explicit SIMULATION mode chosen by the user: synthetic prices,
+        // labelled as such, never used with real money.
         rows = buildRows(now, 'mock')
+        books = {}
+        for (const r of rows) books[r.symbol] = { bid: r.priceUsd, ask: r.priceUsd }
       }
 
       const priceBySym: Record<string, number> = {}
@@ -348,9 +393,6 @@ export function useBinanceBot() {
         lastUpdatedAt: now,
       }))
 
-      if (liveErr) {
-        log(`Binance API no disponible — usando motor demo determinista`, 'warn')
-      }
 
       // 2. SELL logic — scan open holdings (spread converged? stop? trail?)
       let cash = stateRef.current.cashUsd
@@ -519,8 +561,9 @@ export function useBinanceBot() {
             continue
           }
 
-          const pnl = (cur - h.buyPrice) * (h.notionalUsd / h.buyPrice)
-          const pnlBps = Math.round(((cur - h.buyPrice) / h.buyPrice) * 10000)
+          // Honest paper exit: Binance taker fee on the buy AND the sell.
+          const pnl = paperRoundTrip(h.notionalUsd, h.buyPrice, cur, TAKER_FEE.binance).pnlUsd
+          const pnlBps = Math.round((pnl / h.notionalUsd) * 10000)
           h.status = 'sold'
           h.soldAt = now
           h.sellPrice = cur
@@ -568,86 +611,103 @@ export function useBinanceBot() {
         }
       }
 
-      // 3. BUY logic — detect divergences ≥ minSpreadBps
+      // 3. TRIANGLE — plan every route on the live books with the 3 Binance
+      // fees; fire only cycles that clear them. DEMO books the planned result,
+      // LIVE executes the 3 legs for real. Same planner, same books, same fees.
       const openBefore = holdings.filter((h) => h.status === 'open')
       const investedBefore = openBefore.reduce((a, h) => a + h.notionalUsd, 0)
       const equityBefore = cash + investedBefore
-      // Compound interest: scale per-trade budget with grown capital
+      // Compound interest: scale per-cycle budget with grown capital
       const compoundFactor = cfg.compound ? Math.max(equityBefore, 1) / Math.max(cfg.capitalUsd, 1) : 1
-      const openCount = openBefore.length
-      let buys = 0
-      for (const route of BINANCE_TRIANGLES) {
-        if (openCount + buys >= cfg.maxHoldings) break
-        const s = routeSpread(route, priceBySym)
-        if (!s) continue
-        const spread = Math.abs(s.spreadBps)
-        if (spread < cfg.minSpreadBps) continue
+      let notional = Math.min(cfg.budgetPerTradeUsd * compoundFactor, cash)
+      const risk = liveRiskRef.current
+      let cooling = false
+      if (cfg.liveTrading && cred) {
+        const today = new Date().toISOString().slice(0, 10)
+        if (risk.day !== today) {
+          risk.day = today
+          risk.realizedPnl = 0
+          risk.consecutiveLosses = 0
+        }
+        if (risk.realizedPnl <= -LIVE_MAX_DAILY_LOSS_USD) {
+          halt(`límite diario alcanzado: ${risk.realizedPnl.toFixed(2)} USD`)
+          return
+        }
+        if (risk.consecutiveLosses >= LIVE_MAX_CONSECUTIVE_LOSSES) {
+          halt(`${risk.consecutiveLosses} ciclos con pérdida seguidos; revisión manual requerida`)
+          return
+        }
+        cooling = Date.now() - risk.lastOrderAt < LIVE_COOLDOWN_MS
+        notional = Math.min(notional, LIVE_MAX_CYCLE_USD, cfg.capitalUsd, cash * (1 - LIVE_FUNDS_BUFFER))
+      }
 
-        const alreadyOpen = holdings.some(
-          (h) => h.status === 'open' && h.routeId === route.id
-        )
-        if (alreadyOpen) continue
+      const candidates: { plan: CyclePlan; route: BinanceTriangleRoute; inter: string }[] = []
+      let best: CyclePlan | null = null
+      if (books && notional >= 1) {
+        for (const route of BINANCE_TRIANGLES) {
+          const inter = BINANCE_SYMBOLS.find((x) => x.symbol === route.usdtSymbol)?.base ?? 'X'
+          const plan = planTriangleCycle(route, inter, books, notional, FEE_BPS_PER_LEG)
+          if (!plan) continue
+          if (!best || plan.netBps > best.netBps) best = plan
+          if (plan.netBps >= MIN_NET_PROFIT_BPS && plan.netProfitUsd > 0) candidates.push({ plan, route, inter })
+        }
+        candidates.sort((a, b) => b.plan.netBps - a.plan.netBps)
+      }
 
-        const notional = Math.min(cfg.budgetPerTradeUsd * compoundFactor, cash)
-        if (notional < 0.01) continue
-
-        const crossCheap = s.impliedUsd < s.directUsd // token cheaper via cross
-        const buyPrice = crossCheap ? s.impliedUsd : s.directUsd
-        const sellPrice = crossCheap ? s.directUsd : s.impliedUsd
-        const profitUsd = ((sellPrice - buyPrice) / buyPrice) * notional
-
-        // LIVE: place the real BUY first — the simulated position below is
-        // only created from the actual fill.
-        if (cfg.liveTrading && cred) {
-          const symbol = `${route.token}USDT`
-          const minNotional = await binanceMinNotional(symbol).catch(() => 0)
-          if (minNotional > 0 && notional < minNotional) {
-            log(
-              `⏭ ${route.name}: ${fmtUsdLocal(notional, 2)} USD < mínimo de Binance (${fmtUsdLocal(minNotional, 2)}) — se omite esta señal`,
-              'warn'
-            )
-            continue
-          }
-          let order
-          try {
-            order = await binanceMarketOrder({ cred, symbol, side: 'BUY', buyQuoteUsd: notional })
-          } catch (e) {
-            halt(`orden BUY ${symbol} rechazada: ${(e as Error).message}`)
-            return
-          }
-          if (order.executedQty <= 0) {
-            halt(`orden BUY ${symbol} sin fills (${order.orderId})`)
-            return
-          }
-          const spent = order.executedQuote
-          const fillPrice = order.price
-          holdings.unshift({
-            id: `bnh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-            routeId: route.id,
-            routeName: route.name,
-            token: route.token,
-            side: crossCheap ? 'cross_cheap' : 'direct_cheap',
-            buyPrice: fillPrice,
-            currentPrice: fillPrice,
-            peakPrice: fillPrice,
-            notionalUsd: spent,
-            status: 'open',
-            boughtAt: now,
-            realBaseQty: order.executedQty,
-            realQuoteUsd: spent,
-            realOrderId: order.orderId,
+      if (candidates.length === 0) {
+        if (best && (s0.stats?.scanCount ?? 0) % 6 === 0) {
+          log(
+            `3-leg: sin ciclo rentable — mejor ${best.routeName} ${best.netBps.toFixed(0)}bps netos ` +
+              `(bruto ${best.grossBps.toFixed(0)}bps − 3×${FEE_BPS_PER_LEG}bps comisión; necesita ≥ ${MIN_NET_PROFIT_BPS})`,
+            'info'
+          )
+        }
+      } else if (!cooling) {
+        const { plan, route, inter } = candidates[0]
+        const path = cyclePathLabel(plan, inter)
+        let pnl = plan.netProfitUsd
+        let legText = plan.legs.map((l) => `${l.side === 'buy' ? 'B' : 'S'}:${l.pair}@${l.price.toPrecision(6)}`).join(' → ')
+        let label = cfg.dataMode === 'mock' && !cfg.liveTrading ? '[simulación]' : '[demo, precios reales]'
+        let executed = true
+        if (cfg.liveTrading && cred && books) {
+          setState((st) => ({ ...st, status: 'executing' }))
+          const outcome = await executeTriangleCycle(binanceVenue(cred, books), plan, route, {
+            books,
+            maxBookSpreadBps: MAX_BOOK_SPREAD_BPS,
           })
+          risk.lastOrderAt = Date.now()
+          if (outcome.kind === 'fatal') {
+            halt(outcome.reason)
+            return
+          }
+          if (outcome.kind === 'skip') {
+            log(`⏭ ${route.name}: ${outcome.reason}`, 'warn')
+            executed = false
+          } else {
+            const legs = outcome.kind === 'done' ? outcome.legs : [...outcome.legs, outcome.unwind]
+            pnl = outcome.netProfitUsd
+            legText = legs.map((l) => `${l.side === 'buy' ? 'B' : 'S'}:${l.pair}@${l.price.toPrecision(6)}`).join(' → ')
+            label = outcome.kind === 'done' ? '[real]' : `DESHECHO [real]: ${outcome.reason}`
+            risk.realizedPnl += pnl
+            risk.consecutiveLosses = pnl < 0 ? risk.consecutiveLosses + 1 : 0
+            realTrades++
+          }
+        } else {
+          // Demo: the cycle settles at the planned USD result (fees included).
+          cash += pnl
+        }
+        if (executed) {
           trades.unshift({
             id: `bnt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-            type: 'buy',
+            type: 'cycle',
             routeId: route.id,
             routeName: route.name,
             token: route.token,
-            priceUsd: fillPrice,
-            notionalUsd: spent,
-            pnlUsd: 0,
-            profitBps: s.spreadBps,
-            reason: `Divergence ${route.token}: ${s.directUsd.toFixed(6)} vs ${s.impliedUsd.toFixed(6)} (${s.spreadBps >= 0 ? '+' : ''}${s.spreadBps}bps) [real]`,
+            priceUsd: plan.legs[0].price,
+            notionalUsd: plan.notionalUsd,
+            pnlUsd: pnl,
+            profitBps: Math.round((pnl / plan.notionalUsd) * 10000),
+            reason: `${path} ${label} ${legText}`,
             status: 'filled',
             createdAt: now,
           })
@@ -655,71 +715,30 @@ export function useBinanceBot() {
             id: `bnp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
             routeId: route.id,
             name: route.name,
-            side: crossCheap ? 'cross_cheap' : 'direct_cheap',
-            buyPrice: fillPrice,
-            sellPrice,
-            spreadBps: s.spreadBps,
-            notionalUsd: spent,
-            profitUsd,
+            side: plan.direction,
+            buyPrice: plan.legs[0].price,
+            sellPrice: plan.legs[2].price,
+            spreadBps: Math.round(plan.grossBps),
+            notionalUsd: plan.notionalUsd,
+            profitUsd: pnl,
             detectedAt: now,
             executed: true,
           })
-          cash -= spent
-          buys++
           log(
-            `LIVE BUY ${symbol} ${order.executedQty} @ ${fillPrice.toFixed(6)} — ${fmtUsdLocal(spent, 2)} USD (${s.spreadBps >= 0 ? '+' : ''}${s.spreadBps}bps)`,
-            'trade'
+            `3-LEG ${path} ${label} ${pnl >= 0 ? '+' : ''}${fmtUsdLocal(pnl, 4)} USD sobre ${fmtUsdLocal(plan.notionalUsd, 2)} — ${legText}`,
+            pnl >= 0 ? 'trade' : 'warn'
           )
-          realTrades++
-          continue
         }
-
-        holdings.unshift({
-          id: `bnh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-          routeId: route.id,
-          routeName: route.name,
-          token: route.token,
-          side: crossCheap ? 'cross_cheap' : 'direct_cheap',
-          buyPrice,
-          currentPrice: buyPrice,
-          peakPrice: buyPrice,
-          notionalUsd: notional,
-          status: 'open',
-          boughtAt: now,
-        })
-        trades.unshift({
-          id: `bnt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-          type: 'buy',
-          routeId: route.id,
-          routeName: route.name,
-          token: route.token,
-          priceUsd: buyPrice,
-          notionalUsd: notional,
-          pnlUsd: 0,
-          profitBps: s.spreadBps,
-          reason: `Divergence ${route.token}: ${s.directUsd.toFixed(6)} vs ${s.impliedUsd.toFixed(6)} (${s.spreadBps >= 0 ? '+' : ''}${s.spreadBps}bps)`,
-          status: 'filled',
-          createdAt: now,
-        })
-        opps.unshift({
-          id: `bnp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-          routeId: route.id,
-          name: route.name,
-          side: crossCheap ? 'cross_cheap' : 'direct_cheap',
-          buyPrice,
-          sellPrice,
-          spreadBps: s.spreadBps,
-          notionalUsd: notional,
-          profitUsd,
-          detectedAt: now,
-          executed: true,
-        })
-        cash -= notional
-        buys++
-        log(
-          `${crossCheap ? 'IMPLIED' : 'DIRECT'} CHEAP — ${route.name}: buy ${buyPrice.toFixed(6)} → sell ${sellPrice.toFixed(6)} USD (${s.spreadBps >= 0 ? '+' : ''}${s.spreadBps}bps)`,
-          'trade'
-        )
+        if (cfg.liveTrading) {
+          if (risk.realizedPnl <= -LIVE_MAX_DAILY_LOSS_USD) {
+            halt(`límite diario alcanzado: P&L real ${risk.realizedPnl.toFixed(2)} USD`)
+            return
+          }
+          if (risk.consecutiveLosses >= LIVE_MAX_CONSECUTIVE_LOSSES) {
+            halt(`${risk.consecutiveLosses} ciclos reales con pérdida seguidos; revisión manual requerida`)
+            return
+          }
+        }
       }
 
       // 3b. LIVE: re-read the real balance after trading so the displayed
@@ -740,9 +759,13 @@ export function useBinanceBot() {
       const invested = open.reduce((a, h) => a + h.notionalUsd, 0)
       const equity = cash + invested
       const sold = holdings.filter((h) => h.status === 'sold')
-      const realized = sold.reduce((a, h) => a + (h.pnlUsd ?? 0), 0)
-      const wins = sold.filter((h) => (h.pnlUsd ?? 0) >= 0).length
-      const total = sold.length
+      // 3-leg cycles close in the same tick: they never become holdings.
+      const cycles = trades.filter((t) => t.type === 'cycle')
+      const realized =
+        sold.reduce((a, h) => a + (h.pnlUsd ?? 0), 0) + cycles.reduce((a, t) => a + t.pnlUsd, 0)
+      const wins =
+        sold.filter((h) => (h.pnlUsd ?? 0) >= 0).length + cycles.filter((t) => t.pnlUsd >= 0).length
+      const total = sold.length + cycles.length
       const prevStats = stateRef.current.stats
       const stats: BinanceStats = {
         running: s0.enabled,
@@ -794,12 +817,6 @@ export function useBinanceBot() {
         )
       }
 
-      if (buys === 0) {
-        log(
-          `Sin divergencias ≥ ${cfg.minSpreadBps}bps este ciclo — ${BINANCE_TRIANGLES.length} rutas rastreadas`,
-          'info'
-        )
-      }
     } finally {
       inFlightRef.current = false
     }

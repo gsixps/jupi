@@ -52,6 +52,7 @@ import {
   type TrianglePairBook,
 } from '@/lib/triangle-exec'
 import { executeLiveTriangle } from '@/lib/kraken-triangle-live'
+import { TAKER_FEE, paperRoundTrip } from '@/lib/paper-fees'
 
 const LIVE_BOT = 'kraken'
 
@@ -366,7 +367,6 @@ export function useKrakenBot() {
       // 1. Refresh quotes — live Kraken API or mock engine
       let raw: Record<string, number>
       let liveData = false
-      let liveErr: unknown = null
       // Full books (bid/ask) — the 3-leg planner prices legs at ask/bid, not last.
       let liveTickers: Record<string, KrakenTickerQuote> | null = null
       if (cfg.liveTrading) {
@@ -397,8 +397,10 @@ export function useKrakenBot() {
           for (const a of KRAKEN_ASSETS) raw[a.symbol] = liveTickers[a.symbol]?.last ?? a.anchorPerQuote
           liveData = true
         } else {
-          liveErr = new Error('kraken api unreachable')
-          raw = buildRaw(now, 'mock')
+          // REAL prices only: no simulated fallback in the demo either.
+          log('Kraken API no disponible — ciclo omitido, sin precios simulados', 'warn')
+          setState((s) => ({ ...s, status: 'paused' }))
+          return
         }
       } else {
         raw = buildRaw(now, 'mock')
@@ -420,9 +422,6 @@ export function useKrakenBot() {
         lastUpdatedAt: now,
       }))
 
-      if (liveErr) {
-        log(`Kraken API no disponible — usando motor demo determinista`, 'warn')
-      }
 
       // 2. SELL logic — scan open holdings (spread converged? stop? trail?)
       let cash = stateRef.current.cashUsd
@@ -627,8 +626,9 @@ export function useKrakenBot() {
             continue
           }
 
-          const pnl = (cur - h.buyPrice) * (h.notionalUsd / h.buyPrice)
-          const pnlBps = Math.round(((cur - h.buyPrice) / h.buyPrice) * 10000)
+          // Honest paper exit: Kraken taker fee on the buy AND the sell.
+          const pnl = paperRoundTrip(h.notionalUsd, h.buyPrice, cur, TAKER_FEE.kraken).pnlUsd
+          const pnlBps = Math.round((pnl / h.notionalUsd) * 10000)
           h.status = 'sold'
           h.soldAt = now
           h.sellPrice = cur
@@ -810,80 +810,82 @@ export function useKrakenBot() {
         }
       }
 
-      // 3. BUY logic — PAPER strategy only (LIVE runs the 3-leg cycle above).
+      // 3. DEMO — the SAME 3-leg planner, books and fees as LIVE above, so a
+      // demo cycle is exactly what the live bot would have done. The cycle
+      // settles at its planned USD result (3 Kraken taker fees included).
       const openBefore = holdings.filter((h) => h.status === 'open')
       const investedBefore = openBefore.reduce((a, h) => a + h.notionalUsd, 0)
       const equityBefore = cash + investedBefore
-      // Compound interest: scale per-trade budget with grown capital
+      // Compound interest: scale per-cycle budget with grown capital
       const compoundFactor = cfg.compound ? Math.max(equityBefore, 1) / Math.max(cfg.capitalUsd, 1) : 1
-      const openCount = openBefore.length
-      let buys = 0
-      for (const route of cfg.liveTrading ? [] : KRAKEN_TRIANGLES) {
-        if (openCount + buys >= cfg.maxHoldings) break
-        const s = routeSpread(route, raw)
-        if (!s) continue
-        const spread = Math.abs(s.spreadBps)
-        if (spread < cfg.minSpreadBps) continue
-
-        const alreadyOpen = holdings.some(
-          (h) => h.status === 'open' && h.routeId === route.id
-        )
-        if (alreadyOpen) continue
-
+      if (!cfg.liveTrading) {
+        const books: Record<string, TrianglePairBook> = {}
+        if (liveTickers) {
+          for (const [sym, q] of Object.entries(liveTickers)) books[sym] = { bid: q.bid, ask: q.ask }
+        } else {
+          // explicit simulation mode: synthetic prices, labelled as such
+          for (const [sym, px] of Object.entries(raw)) books[sym] = { bid: px, ask: px }
+        }
         const notional = Math.min(cfg.budgetPerTradeUsd * compoundFactor, cash)
-        if (notional < 0.01) continue
-
-        const crossCheap = s.impliedUsd < s.directUsd // token cheaper via cross
-        const buyPrice = crossCheap ? s.impliedUsd : s.directUsd
-        const sellPrice = crossCheap ? s.directUsd : s.impliedUsd
-        const profitUsd = ((sellPrice - buyPrice) / buyPrice) * notional
-
-        holdings.unshift({
-          id: `krh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-          routeId: route.id,
-          routeName: route.name,
-          token: route.token,
-          side: crossCheap ? 'cross_cheap' : 'direct_cheap',
-          buyPrice,
-          currentPrice: buyPrice,
-          peakPrice: buyPrice,
-          notionalUsd: notional,
-          status: 'open',
-          boughtAt: now,
-        })
-        trades.unshift({
-          id: `krt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-          type: 'buy',
-          routeId: route.id,
-          routeName: route.name,
-          token: route.token,
-          priceUsd: buyPrice,
-          notionalUsd: notional,
-          pnlUsd: 0,
-          profitBps: s.spreadBps,
-          reason: `Divergence ${route.token}: ${s.directUsd.toFixed(6)} vs ${s.impliedUsd.toFixed(6)} (${s.spreadBps >= 0 ? '+' : ''}${s.spreadBps}bps)`,
-          status: 'filled',
-          createdAt: now,
-        })
-        opps.unshift({
-          id: `krp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-          routeId: route.id,
-          name: route.name,
-          side: crossCheap ? 'cross_cheap' : 'direct_cheap',
-          buyPrice,
-          sellPrice,
-          spreadBps: s.spreadBps,
-          notionalUsd: notional,
-          profitUsd,
-          detectedAt: now,
-          executed: true,
-        })
-        cash -= notional
-        buys++
-        log(
-          `${crossCheap ? 'IMPLIED' : 'DIRECT'} CHEAP — ${route.name}: buy ${buyPrice.toFixed(6)} → sell ${sellPrice.toFixed(6)} USD (${s.spreadBps >= 0 ? '+' : ''}${s.spreadBps}bps)`,
-          'trade'
-        )
+        let best: CyclePlan | null = null
+        let pick: { plan: CyclePlan; route: KrakenTriangleRoute; inter: string } | null = null
+        if (notional >= 1) {
+          for (const route of KRAKEN_TRIANGLES) {
+            const inter = KRAKEN_ASSETS.find((a) => a.symbol === route.usdtSymbol)?.base ?? 'X'
+            const plan = planTriangleCycle(route, inter, books, notional, LIVE_FEE_BPS_PER_LEG)
+            if (!plan) continue
+            if (!best || plan.netBps > best.netBps) best = plan
+            if (plan.netBps >= LIVE_MIN_NET_PROFIT_BPS && plan.netProfitUsd > 0 && (!pick || plan.netBps > pick.plan.netBps)) {
+              pick = { plan, route, inter }
+            }
+          }
+        }
+        if (pick) {
+          const { plan, route, inter } = pick
+          const path = cyclePathLabel(plan, inter)
+          const label = liveTickers ? '[demo, precios reales]' : '[simulación]'
+          const legText = plan.legs
+            .map((l) => `${l.side === 'buy' ? 'B' : 'S'}:${l.pair}@${l.price.toPrecision(6)}`)
+            .join(' → ')
+          cash += plan.netProfitUsd
+          trades.unshift({
+            id: `krt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            type: 'cycle',
+            routeId: route.id,
+            routeName: route.name,
+            token: route.token,
+            priceUsd: plan.legs[0].price,
+            notionalUsd: plan.notionalUsd,
+            pnlUsd: plan.netProfitUsd,
+            profitBps: Math.round(plan.netBps),
+            reason: `${path} ${label} ${legText}`,
+            status: 'filled',
+            createdAt: now,
+          })
+          opps.unshift({
+            id: `krp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            routeId: route.id,
+            name: route.name,
+            side: plan.direction,
+            buyPrice: plan.legs[0].price,
+            sellPrice: plan.legs[2].price,
+            spreadBps: Math.round(plan.grossBps),
+            notionalUsd: plan.notionalUsd,
+            profitUsd: plan.netProfitUsd,
+            detectedAt: now,
+            executed: true,
+          })
+          log(
+            `3-LEG ${path} ${label} +${fmtUsdKraken(plan.netProfitUsd, 4)} USD (+${plan.netBps.toFixed(1)}bps netos) — ${legText}`,
+            'trade'
+          )
+        } else if (best && (s0.stats?.scanCount ?? 0) % 6 === 0) {
+          log(
+            `3-leg: sin ciclo rentable — mejor ${best.routeName} ${best.netBps.toFixed(0)}bps netos ` +
+              `(bruto ${best.grossBps.toFixed(0)}bps − 3×${LIVE_FEE_BPS_PER_LEG}bps comisión; necesita ≥ ${LIVE_MIN_NET_PROFIT_BPS})`,
+            'info'
+          )
+        }
       }
 
       // 3b. LIVE: re-read the real balance after trading so the displayed
@@ -963,12 +965,6 @@ export function useKrakenBot() {
         )
       }
 
-      if (buys === 0) {
-        log(
-          `Sin divergencias ≥ ${cfg.minSpreadBps}bps este ciclo — ${KRAKEN_TRIANGLES.length} rutas rastreadas`,
-          'info'
-        )
-      }
     } finally {
       inFlightRef.current = false
     }
