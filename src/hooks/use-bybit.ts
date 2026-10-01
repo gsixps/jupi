@@ -25,6 +25,7 @@ import {
   buildRwaRows,
   basisBps,
   fetchBybitRwaPrices,
+  type BybitQuote,
   type BybitRwaRow,
 } from '@/lib/bybit'
 import {
@@ -40,6 +41,7 @@ import {
     type ExchangeCredentials,
     type BybitInstrumentFilters,
   } from '@/lib/cex'
+import { TAKER_FEE } from '@/lib/paper-fees'
 import type { EquityPoint } from '@/lib/trading-types'
 import {
   clearLiveSnapshot,
@@ -53,6 +55,7 @@ const LIVE_BOT = 'bybit'
 const PRICE_HISTORY_CAP = 60
 const TRADE_CAP = 200
 const LOG_CAP = 120
+
 
 export interface BybitConfig {
   capitalUsd: number
@@ -71,12 +74,25 @@ export interface BybitConfig {
   liveTrading: boolean
 }
 
+/** Bybit taker fees: spot (xStocks) and USDT linear perp, per side. */
+const SPOT_FEE = TAKER_FEE.bybitSpot
+const PERP_FEE = TAKER_FEE.bybitPerp
+/** Opening AND closing both legs: 2 × (spot + perp) taker fees, in bps. */
+const ROUND_TRIP_COST_BPS = 2 * (SPOT_FEE + PERP_FEE) * 10000
+/** Extra edge required over the round-trip costs before opening. */
+const MIN_EDGE_BPS = 10
+
+/** Executable entry basis needed to open: costs + edge + the exit target. */
+export function effectiveEntryBps(cfg: Pick<BybitConfig, 'entryBasisBps' | 'exitBasisBps'>): number {
+  return Math.max(cfg.entryBasisBps, cfg.exitBasisBps + ROUND_TRIP_COST_BPS + MIN_EDGE_BPS)
+}
+
 export const DEFAULT_BYBIT_CONFIG: BybitConfig = {
   capitalUsd: 10000,
   budgetPerTradeUsd: 2000,
   maxHoldings: 5,
-  entryBasisBps: 15,
-  exitBasisBps: 3,
+  entryBasisBps: 50,
+  exitBasisBps: 5,
   stopLossBps: 40,
   trailingBps: 25,
   tickIntervalMs: 10000,
@@ -116,6 +132,9 @@ export interface BybitHolding {
   realOrderId?: string
   /** Order id of the real perp order, when live. */
   realPerpOrderId?: string
+  /** Funding received (+) or paid (−) by the perp leg so far, in USD. */
+  fundingUsd?: number
+  lastFundingAt?: number
 }
 
 export interface BybitTrade {
@@ -198,12 +217,13 @@ export interface BybitState {
 }
 
 function initialRows(): BybitRwaRow[] {
-  return buildRwaRows(null, DEFAULT_BYBIT_CONFIG.entryBasisBps)
+  return buildRwaRows(null, effectiveEntryBps(DEFAULT_BYBIT_CONFIG))
 }
 
 /** Expected profit if the basis converges to exitBasisBps on a notional. */
 function expectedProfitUsd(notional: number, entryBasisBps: number, exitBasisBps: number): number {
-  const converge = Math.abs(entryBasisBps) - exitBasisBps
+  // net of the 4 taker fees (open + close, both legs); funding not included
+  const converge = Math.abs(entryBasisBps) - exitBasisBps - ROUND_TRIP_COST_BPS
   if (converge <= 0) return 0
   return (notional * converge) / 10000
 }
@@ -315,6 +335,8 @@ export function useBybitBot() {
   stateRef.current = state
   const loopRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const inFlightRef = useRef(false)
+  /** consecutive ticks without fresh Bybit quotes */
+  const liveFailRef = useRef(0)
 
   const log = useCallback((msg: string, level: BybitLogEntry['level'] = 'info') => {
     setState((s) => ({
@@ -349,16 +371,25 @@ export function useBybitBot() {
       const now = Date.now()
       const cfg = s0.config
 
-      // 1. Prices — real Bybit V5 tickers, deterministic mock as fallback
-      let live: Record<string, number> | null = null
-      if (cfg.dataMode === 'live') {
+      // 1. Prices — real Bybit V5 books (bid/ask + funding). REAL prices only:
+      // if Bybit is unreachable the tick is skipped, in demo and in live.
+      let live: Record<string, BybitQuote> | null = null
+      if (cfg.dataMode === 'live' || cfg.liveTrading) {
         try {
           live = await fetchBybitRwaPrices()
-        } catch {
-          live = null
+          liveFailRef.current = 0
+        } catch (e) {
+          liveFailRef.current += 1
+          inFlightRef.current = false
+          if (cfg.liveTrading && liveFailRef.current >= 5) {
+            halt(`Bybit API inaccesible ${liveFailRef.current} ciclos seguidos — detenido por seguridad`)
+            return
+          }
+          log(`Bybit API no disponible (${(e as Error).message}) — ciclo omitido, sin precios simulados`, 'warn')
+          return
         }
       }
-      const rows = buildRwaRows(live, cfg.entryBasisBps, now)
+      const rows = buildRwaRows(live, effectiveEntryBps(cfg), now)
       const liveData = !!live && rows.some((r) => r.dataLive)
       const rowByPair = new Map(rows.map((r) => [r.pairId, r]))
 
@@ -447,7 +478,17 @@ export function useBybitBot() {
         if (h.status !== 'open') continue
         const row = rowByPair.get(h.pairId)
         if (!row) continue
-        const cur = basisBps(row.spotUsd, row.perpUsd)
+        // Funding: the short perp of a perp-rich hedge receives it when the
+        // rate is positive (and pays when negative); a long perp the reverse.
+        const since = h.lastFundingAt ?? h.openedAt
+        const dtH = Math.max(0, now - since) / 3_600_000
+        const perShort = row.fundingRate * (dtH / (row.fundingIntervalH || 8))
+        h.fundingUsd = (h.fundingUsd ?? 0) + h.notionalUsd * (h.perpSide === 'sell' ? perShort : -perShort)
+        h.lastFundingAt = now
+        // EXECUTABLE exit basis (perp bought back at ask, spot sold at bid).
+        const cur = Math.round(
+          h.side === 'perp_rich' && row.dataLive ? row.exitRichBps : basisBps(row.spotUsd, row.perpUsd)
+        )
         h.currentBasisBps = cur
         h.peakBasisBps = Math.max(h.peakBasisBps, cur)
 
@@ -464,9 +505,12 @@ export function useBybitBot() {
         }
         if (!reason) continue
 
-        // P&L: the hedge is market-neutral, so the convergence is the edge.
-        // Closed notional × how much the basis moved toward zero.
-        const pnl = (h.notionalUsd * (Math.abs(h.entryBasisBps) - Math.abs(cur))) / 10000
+        // P&L: the hedge is market-neutral, so the convergence is the edge —
+        // minus the 4 taker fees (open + close, both legs) plus the funding
+        // the perp leg collected while open.
+        const gross = (h.notionalUsd * (Math.abs(h.entryBasisBps) - Math.abs(cur))) / 10000
+        const fees = (h.notionalUsd * ROUND_TRIP_COST_BPS) / 10000
+        const pnl = gross - fees + (h.fundingUsd ?? 0)
 
         if (realMode && cred) {
           const [spotF, perpF] = await Promise.all([
@@ -549,7 +593,9 @@ export function useBybitBot() {
         h.status = 'closed'
         h.closedAt = now
         h.pnlUsd = pnl
-        if (realMode) cash += pnl
+        // Demo: the capital comes back with its result. Live: `cash` is the
+        // real balance re-read after the closing orders — never add twice.
+        if (!realMode) cash += h.notionalUsd + pnl
         trades.unshift({
           id: `byt_${now}_${Math.random().toString(36).slice(2, 6)}`,
           type: 'close',
@@ -593,10 +639,13 @@ export function useBybitBot() {
         // The real per-symbol minimum is checked further down, once the
         // instrument filters for this pair are known.
 
-        const perpRich = r.basisBps > 0
+        // Only the perp-rich hedge (buy spot / short perp) can be opened from
+        // USDT. The reverse needs spot inventory to sell — never assumed.
+        const perpRich = true
         const spotSide: 'buy' | 'sell' = perpRich ? 'buy' : 'sell'
         const perpSide: 'buy' | 'sell' = perpRich ? 'sell' : 'buy'
-        const spotQty = notional / r.spotUsd
+        const spotAsk = live?.[r.spotSymbol]?.ask || r.spotUsd
+        const spotQty = notional / spotAsk
         // Demo sizing; replaced by the real fill in live mode.
         let bookedSpotQty = spotQty
         let bookedPerpQty = notional / r.perpUsd
@@ -732,9 +781,11 @@ export function useBybitBot() {
           side: perpRich ? 'perp_rich' : 'perp_cheap',
           spotSide,
           perpSide,
-          entryBasisBps: r.basisBps,
-          currentBasisBps: r.basisBps,
-          peakBasisBps: r.basisBps,
+          entryBasisBps: Math.round(r.entryRichBps),
+          currentBasisBps: Math.round(r.entryRichBps),
+          peakBasisBps: Math.round(r.entryRichBps),
+          fundingUsd: 0,
+          lastFundingAt: now,
           notionalUsd: notional,
           spotQty: bookedSpotQty,
           perpQty: bookedPerpQty,
@@ -771,7 +822,7 @@ export function useBybitBot() {
           spotUsd: r.spotUsd,
           perpUsd: r.perpUsd,
           notionalUsd: notional,
-          profitUsd: expectedProfitUsd(notional, r.basisBps, cfg.exitBasisBps),
+          profitUsd: expectedProfitUsd(notional, r.entryRichBps, cfg.exitBasisBps),
           detectedAt: now,
           executed: true,
         })

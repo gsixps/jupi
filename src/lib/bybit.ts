@@ -13,9 +13,10 @@
 // capital-efficient arbitrage rather than a directional bet on a stock.
 //
 // Market data comes from the REAL public Bybit V5 API
-// (https://api.bybit.com/v5/market/tickers). When the browser cannot reach
-// Bybit (sandbox), a deterministic mock engine anchored at the last real
-// quotes takes over — same pattern as the Binance / Kraken / Curve tabs.
+// (https://api.bybit.com/v5/market/tickers): best bid/ask of both legs and
+// the perp funding rate. When Bybit is unreachable the bot skips the tick —
+// it never trades on simulated prices. The mock engine below only runs in
+// the explicit SIMULATION data mode.
 
 export const BYBIT_API_BASE = "https://api.bybit.com"
 export const BYBIT_SPOT_TICKERS = `${BYBIT_API_BASE}/v5/market/tickers?category=spot`
@@ -207,9 +208,19 @@ export interface BybitRwaRow {
   spotUsd: number
   perpUsd: number
   anchorUsd: number
-  /** Signed basis in bps: (perp - spot) / spot. Positive = perp rich. */
+  /** Signed basis in bps on LAST prices: (perp - spot) / spot. Display only. */
   basisBps: number
-  /** True when |basis| ≥ entry threshold → tradeable window. */
+  /** EXECUTABLE entry basis of a perp-rich hedge: sell the perp at its bid,
+   *  buy the spot at its ask. This is what an order would actually capture. */
+  entryRichBps: number
+  /** EXECUTABLE exit basis of that hedge: buy the perp back at its ask, sell
+   *  the spot at its bid. */
+  exitRichBps: number
+  /** Perp funding per interval (fraction; 0.0001 = 0.01%). The SHORT perp
+   *  leg of a perp-rich hedge receives it when positive. */
+  fundingRate: number
+  fundingIntervalH: number
+  /** True when the executable entry clears the threshold → tradeable window. */
   tradable: boolean
   dataLive: boolean
 }
@@ -223,25 +234,48 @@ export function basisBps(spotUsd: number, perpUsd: number): number {
   return Math.round(((perpUsd - spotUsd) / spotUsd) * 10000)
 }
 
-/** Build the RWA rows from a {symbol → price} map, falling back to the mock. */
+/** Live quote of one symbol from the Bybit V5 tickers. */
+export interface BybitQuote {
+  last: number
+  bid: number
+  ask: number
+  /** linear only */
+  fundingRate?: number
+  fundingIntervalH?: number
+}
+
+/**
+ * Build the RWA rows. With `live` quotes a row is tradable only when BOTH legs
+ * have a live book — a missing leg is never filled with a simulated price.
+ * `live === null` is the explicit SIMULATION mode (synthetic prices).
+ */
 export function buildRwaRows(
-  live: Record<string, number> | null,
+  live: Record<string, BybitQuote> | null,
   entryBps: number,
   now = Date.now()
 ): BybitRwaRow[] {
   return BYBIT_RWA_PAIRS.map((p) => {
-    const liveSpot = live?.[p.spotSymbol]
-    const livePerp = live?.[p.perpSymbol]
-    const hasSpot = liveSpot !== undefined && liveSpot > 0
-    const hasPerp = livePerp !== undefined && livePerp > 0
-    const dataLive = hasSpot && hasPerp
-    const spotUsd = hasSpot
-      ? liveSpot
-      : mockRwaPrice(p.spotSymbol, p.anchorUsd, now, { leg: 'spot', pairId: p.id })
-    const perpUsd = hasPerp
-      ? livePerp
-      : mockRwaPrice(p.perpSymbol, p.anchorUsd, now, { leg: 'perp', pairId: p.id })
-    const bps = basisBps(spotUsd, perpUsd)
+    const s = live?.[p.spotSymbol]
+    const f = live?.[p.perpSymbol]
+    const dataLive = !!(s && f && s.bid > 0 && s.ask > 0 && f.bid > 0 && f.ask > 0)
+    let spotBid: number, spotAsk: number, perpBid: number, perpAsk: number
+    let spotUsd: number, perpUsd: number
+    if (live) {
+      spotUsd = s?.last ?? p.anchorUsd
+      perpUsd = f?.last ?? p.anchorUsd
+      spotBid = s?.bid ?? 0
+      spotAsk = s?.ask ?? 0
+      perpBid = f?.bid ?? 0
+      perpAsk = f?.ask ?? 0
+    } else {
+      spotUsd = mockRwaPrice(p.spotSymbol, p.anchorUsd, now, { leg: 'spot', pairId: p.id })
+      perpUsd = mockRwaPrice(p.perpSymbol, p.anchorUsd, now, { leg: 'perp', pairId: p.id })
+      spotBid = spotAsk = spotUsd
+      perpBid = perpAsk = perpUsd
+    }
+    const ok = live ? dataLive : true
+    const entryRichBps = ok && spotAsk > 0 ? ((perpBid - spotAsk) / spotAsk) * 10000 : 0
+    const exitRichBps = ok && spotBid > 0 ? ((perpAsk - spotBid) / spotBid) * 10000 : 0
     return {
       pairId: p.id,
       token: p.token,
@@ -253,20 +287,24 @@ export function buildRwaRows(
       spotUsd,
       perpUsd,
       anchorUsd: p.anchorUsd,
-      basisBps: bps,
-      tradable: Math.abs(bps) >= entryBps,
-      dataLive,
+      basisBps: basisBps(spotUsd, perpUsd),
+      entryRichBps,
+      exitRichBps,
+      fundingRate: f?.fundingRate ?? 0,
+      fundingIntervalH: f?.fundingIntervalH ?? 8,
+      tradable: ok && entryRichBps >= entryBps,
+      dataLive: live ? dataLive : false,
     }
   })
 }
 
 /**
- * Fetch both legs from the public Bybit V5 tickers endpoints. Returns a map of
- * symbol → last price for every RWA symbol we watch. Partial results are fine:
- * missing legs simply fall back to the mock engine per row.
+ * Fetch both legs from the public Bybit V5 tickers endpoints: last, best
+ * bid/ask and (perps) the current funding rate and interval. Throws when
+ * either endpoint fails — callers skip the tick instead of simulating.
  */
-export async function fetchBybitRwaPrices(): Promise<Record<string, number>> {
-  const out: Record<string, number> = {}
+export async function fetchBybitRwaPrices(): Promise<Record<string, BybitQuote>> {
+  const out: Record<string, BybitQuote> = {}
   const want = new Set<string>()
   for (const p of BYBIT_RWA_PAIRS) {
     want.add(p.spotSymbol)
@@ -282,20 +320,42 @@ export async function fetchBybitRwaPrices(): Promise<Record<string, number>> {
       const j = (await res.json()) as {
         retCode: number
         retMsg: string
-        result: { list: { symbol: string; lastPrice: string }[] }
+        result: {
+          list: {
+            symbol: string
+            lastPrice: string
+            bid1Price?: string
+            ask1Price?: string
+            fundingRate?: string
+            fundingIntervalHour?: string
+          }[]
+        }
       }
       if (j.retCode !== 0) throw new Error(`bybit ${category} ${j.retCode}: ${j.retMsg}`)
       for (const x of j.result.list) {
         if (!want.has(x.symbol)) continue
-        const px = parseFloat(x.lastPrice)
-        if (isFinite(px) && px > 0) out[x.symbol] = px
+        const last = parseFloat(x.lastPrice)
+        const bid = parseFloat(x.bid1Price ?? '')
+        const ask = parseFloat(x.ask1Price ?? '')
+        if (!(last > 0)) continue
+        const q: BybitQuote = {
+          last,
+          bid: bid > 0 ? bid : 0,
+          ask: ask > 0 ? ask : 0,
+        }
+        if (category === 'linear') {
+          const fr = parseFloat(x.fundingRate ?? '')
+          const iv = parseFloat(x.fundingIntervalHour ?? '')
+          q.fundingRate = isFinite(fr) ? fr : 0
+          q.fundingIntervalH = iv > 0 ? iv : 8
+        }
+        out[x.symbol] = q
       }
     } finally {
       clearTimeout(t)
     }
   }
 
-  await pull('spot', BYBIT_SPOT_TICKERS)
-  await pull('linear', BYBIT_LINEAR_TICKERS)
+  await Promise.all([pull('spot', BYBIT_SPOT_TICKERS), pull('linear', BYBIT_LINEAR_TICKERS)])
   return out
 }
