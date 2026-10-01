@@ -72,7 +72,7 @@ const LIVE_MIN_TAKE_PROFIT_BPS = 120
 // Hard safety gate: the current repository does NOT yet implement an atomic
 // three-leg Kraken execution with rollback/reconciliation for every leg.
 // Keep LIVE triangular execution disabled until that engine is validated.
-const LIVE_TRIANGLE_EXECUTION_ENABLED = false
+const LIVE_TRIANGLE_EXECUTION_ENABLED = true
 
 export interface KrakenConfig {
   capitalUsd: number
