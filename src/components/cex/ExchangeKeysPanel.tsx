@@ -66,21 +66,20 @@ function describePaste(kind: ExchangeKind, key: string, secret: string): string 
   if (!secret) return 'Falta el API secret.'
   const notes: string[] = [`key ${maskKey(key)}`]
   const isBinance = (s: string) => s.length === 64 && /^[0-9a-f]+$/.test(s)
-  const isKraken = (s: string) =>
-    s.length >= 84 && s.length <= 88 && /^[A-Za-z0-9+/=]+$/.test(s) && (/[A-Z]/.test(s) || /[+/=]/.test(s))
   if (isBinance(key) && isBinance(secret)) {
     notes.push(
       kind === 'kraken'
         ? 'formato de 64 hexadecimales = BINANCE, no Kraken'
         : 'formato hexadecimal, el habitual de Binance'
     )
-  } else if (isKraken(key) && isKraken(secret)) {
-    notes.push('formato base64 largo, coherente con Kraken')
   }
-  if (key.length < 40) {
-    notes.push(
-      'la key es demasiado corta: la de Kraken suele tener 84-88 caracteres y la de Binance 64'
-    )
+  if (kind === 'kraken') {
+    if (key.length !== 56) {
+      notes.push(`la key de Kraken debe tener 56 caracteres (tiene ${key.length})`)
+    }
+    if (secret.length !== 88) {
+      notes.push(`el secret de Kraken debe tener 88 caracteres (tiene ${secret.length})`)
+    }
   }
   if (!/^[A-Za-z0-9+/=_-]+$/.test(key)) {
     notes.push('la key contiene caracteres que no son de una API key (espacios, comas, dos puntos)')
