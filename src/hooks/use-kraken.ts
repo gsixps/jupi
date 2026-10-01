@@ -65,6 +65,9 @@ const LIVE_COOLDOWN_MS = 60_000
 const LIVE_FUNDS_BUFFER = 0.02
 /** Kraken's smallest order cost on USD pairs (costmin 0.5). */
 const LIVE_MIN_ORDER_USD = 0.5
+/** Take-profit floor in LIVE: must clear the round trip of taker fees
+ *  (2 × ≤0.40%) plus slippage, whatever the minSpreadBps slider says. */
+const LIVE_MIN_TAKE_PROFIT_BPS = 120
 
 // Hard safety gate: the current repository does NOT yet implement an atomic
 // three-leg Kraken execution with rollback/reconciliation for every leg.
@@ -492,12 +495,15 @@ export function useKrakenBot() {
         // current normalized USD per token depends on which leg was bought
         const cur = cfg.liveTrading ? s.directUsd : (h.side === 'cross_cheap' ? s.directUsd : s.impliedUsd)
         h.currentPrice = cur
-        const target = h.buyPrice * (1 + cfg.minSpreadBps / 10000)
+        const takeProfitBps = cfg.liveTrading
+          ? Math.max(cfg.minSpreadBps, LIVE_MIN_TAKE_PROFIT_BPS)
+          : cfg.minSpreadBps
+        const target = h.buyPrice * (1 + takeProfitBps / 10000)
         const stop = h.buyPrice * (1 - cfg.stopLossBps / 10000)
 
         let reason: string | null = null
         if (cur >= target) {
-          reason = `Take profit ${cfg.minSpreadBps}bps`
+          reason = `Take profit ${takeProfitBps}bps`
         } else if (cur <= stop) {
           reason = `Stop loss -${cfg.stopLossBps}bps`
         } else if (
@@ -528,7 +534,8 @@ export function useKrakenBot() {
               halt(`orden SELL ${pair} sin fills (${order.orderId})`)
               return
             }
-            const proceeds = order.executedQuote
+            // fciq: Kraken takes the fee from the USD side — net it out.
+            const proceeds = order.executedQuote - (order.feeQuote ?? 0)
             h.realExitOrderId = order.orderId
             h.sellPrice = order.price
             h.currentPrice = order.price
@@ -758,7 +765,8 @@ export function useKrakenBot() {
             halt(`orden BUY ${pair} sin fills (${order.orderId})`)
             return
           }
-          const spent = order.executedQuote
+          // fciq: the fee is charged in USD on top of the cost.
+          const spent = order.executedQuote + (order.feeQuote ?? 0)
           const fillPrice = order.price
           holdings.unshift({
             id: `krh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,

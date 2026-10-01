@@ -80,6 +80,22 @@ export interface ExchangeOrderResult {
   executedQty: number
   executedQuote: number // quote currency amount filled
   price: number // average fill price (0 for unknown)
+  /** Exchange fee in the QUOTE currency (oflags=fciq on Kraken). P&L must
+   *  subtract it from proceeds (sell) or add it to cost (buy). */
+  feeQuote?: number
+}
+
+/**
+ * Serialize a number as a FLAT decimal, never exponential. `String(1e-7)` is
+ * "1e-7", which Kraken rejects (EGeneral:Invalid arguments).
+ */
+export function flatDecimal(n: number): string {
+  if (!isFinite(n)) return "0"
+  if (Number.isInteger(n)) return String(n)
+  let s = n.toFixed(12)
+  s = s.replace(/0+$/, "").replace(/\.$/, "")
+  if (s === "" || s === "-0") s = "0"
+  return s
 }
 
 // ================= BINANCE =================
@@ -312,8 +328,8 @@ export async function krakenMarketOrder(opts: KrakenOrderOpts): Promise<Exchange
       pair: opts.pair,
       type: opts.side,
       ordertype: opts.ordertype ?? "market",
-      ...(opts.ordertype === "limit" && opts.price ? { price: String(opts.price) } : {}),
-      volume,
+      ...(opts.ordertype === "limit" && opts.price ? { price: flatDecimal(opts.price) } : {}),
+      volume: flatDecimal(volume),
       oflags: "fciq",
     },
     opts.cred
@@ -321,46 +337,52 @@ export async function krakenMarketOrder(opts: KrakenOrderOpts): Promise<Exchange
   const txid = (result.txid ?? [])[0]
   if (!txid) throw new Error("Kraken did not return an order id")
 
-  // AddOrder only acknowledges the order. Query it so callers get the real
-  // filled volume and cost instead of assuming the whole amount filled.
-  // Kraken fills asynchronously, so a single immediate read usually returns
-  // zero; poll until the order stops reporting a partial execution.
+  // AddOrder only acknowledges the order. Poll QueryOrders for the real fill.
+  // Kraken's private counter allows ~1 call/s, so back off (0.7s → 4s) and
+  // RETRY on errors: a rate-limit answer is not "zero fills". If nothing can
+  // be confirmed before the deadline, throw with the order id so the bot halts
+  // and the user checks Kraken, instead of forgetting a position that filled.
   let executedQty = 0
   let executedQuote = 0
+  let feeQuote = 0
   let price = 0
-  const deadline = Date.now() + (opts.fillTimeoutMs ?? 15_000)
+  let confirmed = false
+  let backoff = 700
+  const deadline = Date.now() + (opts.fillTimeoutMs ?? 20_000)
   for (;;) {
+    await sleep(backoff)
     try {
       const q = (await krakenSignedPost("/0/private/QueryOrders", { txid }, opts.cred)) as Record<
         string,
-        { vol_exec?: string; cost?: string; price?: string; status?: string; vol?: string }
+        { vol_exec?: string; cost?: string; fee?: string; price?: string; status?: string; vol?: string }
       >
       const o = q[txid]
       if (o) {
-        const volExec = parseFloat(o.vol_exec ?? "0") || 0
-        // A closed/cancelled order is final: stop waiting and report what filled.
         const status = (o.status ?? "").toLowerCase()
+        executedQty = parseFloat(o.vol_exec ?? "0") || 0
+        executedQuote = parseFloat(o.cost ?? "0") || 0
+        feeQuote = parseFloat(o.fee ?? "0") || 0
+        price = parseFloat(o.price ?? "0") || 0
+        // closed/canceled/expired are final: report exactly what filled.
         if (status === "closed" || status === "canceled" || status === "expired") {
-          executedQty = volExec
-          executedQuote = parseFloat(o.cost ?? "0") || 0
-          price = parseFloat(o.price ?? "0") || 0
+          confirmed = true
           break
         }
-        if (volExec > 0) {
-          executedQty = volExec
-          executedQuote = parseFloat(o.cost ?? "0") || 0
-          price = parseFloat(o.price ?? "0") || 0
-          // Fully filled: nothing left to wait for.
-          if (volExec >= (parseFloat(o.vol ?? "0") || 0) - 1e-12) break
+        if (executedQty > 0 && executedQty >= (parseFloat(o.vol ?? "0") || 0) - 1e-12) {
+          confirmed = true
+          break
         }
       }
     } catch {
-      // Order placed but not verifiable — report zero fills so the bot halts
-      // rather than assuming a position it cannot confirm.
-      break
+      // rate limit / transient error — retry until the deadline
     }
     if (Date.now() >= deadline) break
-    await sleep(700)
+    backoff = Math.min(backoff * 2, 4000)
+  }
+  if (!confirmed && executedQty <= 0) {
+    throw new Error(
+      `orden ${txid} enviada pero sin confirmar (timeout/rate limit de Kraken). NO la reenvíes: revísala en Kraken → Órdenes antes de volver a arrancar.`
+    )
   }
   if (price > 0 && executedQty > 0 && executedQuote === 0) {
     executedQuote = price * executedQty
@@ -373,6 +395,7 @@ export async function krakenMarketOrder(opts: KrakenOrderOpts): Promise<Exchange
     executedQty,
     executedQuote,
     price: price > 0 ? price : executedQty > 0 ? executedQuote / executedQty : 0,
+    feeQuote,
   }
 }
 
