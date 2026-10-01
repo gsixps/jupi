@@ -26,6 +26,7 @@ import type {
   CurvePool,
   CurvePoolRow,
 } from '@/lib/curve'
+import { TAKER_FEE } from '@/lib/paper-fees'
 import type { EquityPoint } from '@/lib/trading-types'
 
 const PRICE_HISTORY_CAP = 60
@@ -46,6 +47,18 @@ export interface CurveConfig {
   liveTrading: boolean
 }
 
+/** Curve pool fee per swap (typical stable pool 0.04%). */
+const POOL_FEE = TAKER_FEE.curvePool
+/** Ethereum mainnet gas of ONE Curve swap, in USD (approve + exchange on a
+ *  quiet day; much higher when the network is busy). */
+const GAS_USD_PER_SWAP = 1.5
+
+/** Spread (bps) a round trip must exceed on `notionalUsd` to break even. */
+function breakEvenBps(notionalUsd: number): number {
+  if (!(notionalUsd > 0)) return Infinity
+  return 2 * POOL_FEE * 10000 + ((2 * GAS_USD_PER_SWAP) / notionalUsd) * 10000
+}
+
 export const DEFAULT_CURVE_CONFIG: CurveConfig = {
   capitalUsd: 10000,
   budgetPerTradeUsd: 2500,
@@ -63,6 +76,8 @@ export interface CurveHolding {
   id: string
   coinSymbol: string // traded coin (underscore real coin)
   buyPool: string
+  /** USD spent on the position (fee + gas of the buy swap included). */
+  notionalUsd: number
   buyPrice: number // usd price paid (cheap pool)
   currentPrice: number // best sell quote right now (dearest pool)
   peakPrice: number
@@ -267,7 +282,6 @@ export function useCurveBot() {
       // 1. Refresh quotes — live Curve API or mock engine
       let pools: CurvePoolRow[]
       let liveData = false
-      let liveErr: unknown = null
       if (cfg.dataMode === 'live') {
         try {
           const live = await fetchCurvePools()
@@ -276,15 +290,15 @@ export function useCurveBot() {
               (x) => x.address.toLowerCase() === p.address.toLowerCase()
             )
           )
-          if (filtered.length > 0) {
-            pools = buildPools(CURVE_STABLE_POOLS, now, 'live', filtered)
-            liveData = true
-          } else {
-            pools = buildPools(CURVE_STABLE_POOLS, now, 'mock')
-          }
+          if (filtered.length === 0) throw new Error('ningún pool vigilado en la respuesta')
+          pools = buildPools(CURVE_STABLE_POOLS, now, 'live', filtered)
+          liveData = true
         } catch (e) {
-          liveErr = e
-          pools = buildPools(CURVE_STABLE_POOLS, now, 'mock')
+          // REAL prices only: skip the tick instead of simulating.
+          inFlightRef.current = false
+          log(`Curve API no disponible (${(e as Error).message}) — ciclo omitido, sin precios simulados`, 'warn')
+          setState((st) => ({ ...st, status: 'paused' }))
+          return
         }
       } else {
         pools = buildPools(CURVE_STABLE_POOLS, now, 'mock')
@@ -308,9 +322,6 @@ export function useCurveBot() {
         lastUpdatedAt: now,
       }))
 
-      if (liveErr && liveData === false) {
-        log(`Curve API no disponible — usando motor demo determinista`, 'warn')
-      }
 
       // 2. SELL logic — scan open holdings
       const coinMap = new Map<string, string>()
@@ -347,9 +358,13 @@ export function useCurveBot() {
         }
 
         if (reason) {
+          // Honest exit: the coins bought with `notionalUsd` are swapped back
+          // at the dear pool, paying its pool fee and the swap gas.
           const sellPrice = bestSell.price
-          const inputUsd = h.buyPrice
-          const outUsd = sellPrice
+          // positions saved by older versions have no notional: treat as 1 coin
+          const inputUsd = h.notionalUsd ?? h.buyPrice
+          const qty = inputUsd / h.buyPrice
+          const outUsd = qty * sellPrice * (1 - POOL_FEE) - GAS_USD_PER_SWAP
           const pnl = outUsd - inputUsd
           const pnlBps = Math.round((pnl / inputUsd) * 10000)
           h.status = 'sold'
@@ -404,7 +419,7 @@ export function useCurveBot() {
       const openCountBefore = holdings.filter((h) => h.status === 'open').length
       const investedBefore = holdings
         .filter((h) => h.status === 'open')
-        .reduce((a, h) => a + h.buyPrice, 0)
+        .reduce((a, h) => a + (h.notionalUsd ?? 0), 0)
       const equityBefore = cash + investedBefore
       // Compound interest: scale per-trade budget with grown capital
       const compoundFactor = cfg.compound ? Math.max(equityBefore, 1) / Math.max(cfg.capitalUsd, 1) : 1
@@ -426,12 +441,19 @@ export function useCurveBot() {
 
         const spend = Math.min(cfg.budgetPerTradeUsd * compoundFactor, cash)
         if (spend < 0.01) continue
+        // The spread must pay 2 pool fees + 2 swaps of gas, not just exist.
+        if (spreadBps < breakEvenBps(spend) + cfg.globalTargetBps) continue
+        // Buy swap: pool fee + gas come out of what the USD buys.
+        const boughtUsd = spend * (1 - POOL_FEE) - GAS_USD_PER_SWAP
+        if (boughtUsd <= 0) continue
+        const effBuyPrice = cheapest.price * (spend / boughtUsd)
 
         holdings.unshift({
           id: `cvh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           coinSymbol: coin.symbol,
           buyPool: cheapest.pool,
-          buyPrice: cheapest.price,
+          notionalUsd: spend,
+          buyPrice: effBuyPrice,
           currentPrice: cheapest.price,
           peakPrice: cheapest.price,
           status: 'open',
@@ -475,7 +497,7 @@ export function useCurveBot() {
 
       // 5. Stats
       const open = holdings.filter((h) => h.status === 'open')
-      const invested = open.reduce((a, h) => a + h.buyPrice, 0)
+      const invested = open.reduce((a, h) => a + (h.notionalUsd ?? 0), 0)
       const equity = cash + invested
       const sold = holdings.filter((h) => h.status === 'sold')
       const realized = sold.reduce((a, h) => a + (h.pnlUsd ?? 0), 0)
