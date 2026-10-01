@@ -24,14 +24,12 @@
 //     modified by trades (BUY decreases, SELL increases).
 //   - Background (non-blocking) refresh of the SUB-WALLET balances each scan
 //     keeps the state in sync with the real chain.
-//   - getQuote tries REAL Jupiter quotes first; if the Quote API is
-//     unreachable it computes from the real price map + capped slippage, so
-//     a quote ALWAYS returns (same as Demo).
-//   - Intraday tick perturbation (OU process anchored to the real price)
-//     gives the bot price movement to trade on (same as Demo).
-//   - When Jupiter returns a real quote AND the trading sub-wallet exists,
-//     the swap is executed ON-CHAIN via executeSwapWithKeypair. Otherwise it
-//     falls back to a paper trade at the real market rate.
+//   - Signals use REAL prices only (the old random "tick perturbation" is
+//     gone). A swap is executed ON-CHAIN via executeSwapWithKeypair only with
+//     a REAL Jupiter quote; without one the trade is skipped — never booked
+//     as a paper fill.
+//   - The trading sub-wallet secret key lives in this browser's localStorage:
+//     WITHDRAW before clearing site data, or the funds in it are lost.
 
 "use client"
 
@@ -169,8 +167,6 @@ export function useLiveTrading(wallet: ReturnType<typeof useWallet>) {
   const lastScanRef = useRef(0)
   const inFlightRef = useRef(false)
   const stoppingRef = useRef(false)
-  // per-mint intraday tick perturbation state (mean-reverting OU process)
-  const pertStateRef = useRef<Record<string, number>>({})
   // track price-fetch failure state so we only log the transition (not every
   // failed scan, which would spam the console during transient outages).
   const priceFetchFailedRef = useRef(false)
@@ -541,29 +537,14 @@ const reason = e?.message ?? (e == null ? "unknown error" : typeof e === "object
       // 1. fetch real prices (Jupiter direct → /api/prices proxy fallback)
       const { prices, change } = await fetchRealPrices(mints)
       const newPriceHistory = { ...s0.priceHistory }
-      // Intraday tick perturbation (SAME as Demo — OU process anchored to real price)
+      // REAL prices only. The old "intraday tick perturbation" added random
+      // noise (±2.5%) to every price so the mean-reversion strategy had dips
+      // to buy — trading on invented moves. Signals now see the market as is.
       const tickPrices: Record<string, number> = { ...prices }
       for (const m of mints) {
         const p = prices[m]
         if (typeof p !== "number" || p <= 0) continue
-        const hist = newPriceHistory[m] ?? []
-        const lastReal = s0.prices[m]
-        const realChanged = !lastReal || Math.abs(p - lastReal) / lastReal > 0.0005
-        // evolve the per-mint perturbation (OU mean-reverting process)
-        let pert = pertStateRef.current[m] ?? 0
-        if (realChanged) {
-          // fresh real data → partial reset (real movement dominates)
-          pert = pert * 0.4 + (Math.random() - 0.5) * 0.002
-        } else {
-          // static (cached) → simulate intraday tick movement (bigger swings)
-          pert = pert * 0.82 + (Math.random() - 0.5) * 0.009
-        }
-        if (pert > 0.025) pert = 0.025
-        if (pert < -0.025) pert = -0.025
-        pertStateRef.current[m] = pert
-        const tickPrice = p * (1 + pert)
-        tickPrices[m] = tickPrice
-        const arr = [...hist, tickPrice]
+        const arr = [...(newPriceHistory[m] ?? []), p]
         if (arr.length > PRICE_HISTORY_CAP) arr.splice(0, arr.length - PRICE_HISTORY_CAP)
         newPriceHistory[m] = arr
       }

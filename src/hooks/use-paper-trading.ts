@@ -59,11 +59,12 @@ export function usePaperTrading() {
       capital: 1000,
       maxPositions: 6,
       tradeSizePct: 15,
-      buyThreshold: 0.25, // aggressive — triggers on small real dips
-      sellThreshold: 0.35, // exit on small reversion (matches buy threshold)
-      stopLossPct: 1.5,
-      arbMinProfitBps: 8,
-      slippageBps: 50,
+      // Same thresholds as the live bot: a demo result is what live would do.
+      buyThreshold: 0.7,
+      sellThreshold: 1.0,
+      stopLossPct: 2.5,
+      arbMinProfitBps: 20,
+      slippageBps: 100,
       scanIntervalMs: 4000,
       tokens: VERIFIED_TOKENS.filter((t) => !t.stable).map((t) => t.mint),
     },
@@ -88,8 +89,6 @@ export function usePaperTrading() {
   const tokensRef = useRef<TokenInfo[]>(VERIFIED_TOKENS)
   const lastScanRef = useRef(0)
   const inFlightRef = useRef(false)
-  // per-mint intraday tick perturbation state (mean-reverting OU process)
-  const pertStateRef = useRef<Record<string, number>>({})
 
   const log = useCallback((msg: string, level: "info" | "warn" | "error" | "trade" = "info") => {
     setState((s) => ({
@@ -242,28 +241,10 @@ export function usePaperTrading() {
     ): Promise<{ outAmount: number; outHuman: number; labels: string[]; outPerIn: number } | null> => {
       const real = await fetchQuoteReal(inputMint, outputMint, uiAmount, slippageBps, tokens)
       if (real) return real
-      // computed fallback from real prices
-      const inTok = tokens.find((t) => t.mint === inputMint)
-      const outTok = tokens.find((t) => t.mint === outputMint)
-      if (!inTok || !outTok) return null
-      const inPrice = prices[inputMint]
-      const outPrice = prices[outputMint]
-      if (!inPrice || !outPrice || outPrice <= 0) return null
-      const inUsd = uiAmount * inPrice
-      // Cap the effective slippage at 10bps — the config.slippageBps is the
-      // user's TOLERANCE, but the ACTUAL execution cost on liquid Solana pools
-      // via Jupiter is ~5-15bps. Using the full tolerance (50bps) would make
-      // every round-trip lose 1% to "slippage" and the bot unprofitable.
-      const effSlippage = Math.min(slippageBps, 10) / 10000
-      const outUsd = inUsd * (1 - effSlippage)
-      const outHuman = outUsd / outPrice
-      const outAmount = Math.floor(outHuman * Math.pow(10, outTok.decimals))
-      return {
-        outAmount,
-        outHuman,
-        labels: ["price-ratio (Jupiter unreachable)"],
-        outPerIn: uiAmount > 0 ? outHuman / uiAmount : 0,
-      }
+      // No computed fallback: a fill the market did not quote is not a fill.
+      void tokens
+      void prices
+      return null
     },
     [fetchQuoteReal]
   )
@@ -287,41 +268,17 @@ export function usePaperTrading() {
       // 1. fetch REAL prices
       const { prices, change } = await fetchRealPrices(mints)
       const newPriceHistory = { ...s0.priceHistory }
-      // Intraday tick estimate: real price feeds (CoinGecko cache) update
-      // slowly (every 1-3 min), so between refreshes the price is static and
-      // the bot has nothing to trade on. We apply a mean-reverting perturbation
-      // (±0.3%) anchored to the REAL price to simulate the intraday market
-      // movement that's actually happening but not reflected in the cached feed.
-      // When the real price changes (cache refresh), the perturbation partially
-      // resets so real data dominates. The anchor is always the real market
-      // price; the ticks are intraday estimates. This gives the bot realistic
-      // price movement to execute mean-reversion trades on.
+      // REAL prices only. The old "intraday tick perturbation" added random
+      // noise (±2.5%) to every price so the mean-reversion strategy had dips
+      // to buy — trading on invented moves. Signals now see the market as is.
       const tickPrices: Record<string, number> = { ...prices }
       for (const m of mints) {
         const p = prices[m]
         if (typeof p !== "number" || p <= 0) continue
-        const hist = newPriceHistory[m] ?? []
-        const lastReal = s0.prices[m]
-        const realChanged = !lastReal || Math.abs(p - lastReal) / lastReal > 0.0005
-        // evolve the per-mint perturbation (OU mean-reverting process)
-        let pert = pertStateRef.current[m] ?? 0
-        if (realChanged) {
-          // fresh real data → partial reset (real movement dominates)
-          pert = pert * 0.4 + (Math.random() - 0.5) * 0.002
-        } else {
-          // static (cached) → simulate intraday tick movement (bigger swings)
-          pert = pert * 0.82 + (Math.random() - 0.5) * 0.009
-        }
-        if (pert > 0.025) pert = 0.025
-        if (pert < -0.025) pert = -0.025
-        pertStateRef.current[m] = pert
-        const tickPrice = p * (1 + pert)
-        tickPrices[m] = tickPrice
-        const arr = [...hist, tickPrice]
+        const arr = [...(newPriceHistory[m] ?? []), p]
         if (arr.length > PRICE_HISTORY_CAP) arr.splice(0, arr.length - PRICE_HISTORY_CAP)
         newPriceHistory[m] = arr
       }
-      // use tick prices for display + trading (real price + intraday estimate)
       setState((s) => ({ ...s, prices: tickPrices, change24h: change, priceHistory: newPriceHistory }))
 
       const balance = stateRef.current.balance
