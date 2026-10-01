@@ -22,7 +22,7 @@ import { useKrakenBot } from '@/hooks/use-kraken'
 import { useCurveBot } from '@/hooks/use-curve'
 import { useSeabot } from '@/hooks/use-seabot'
 import { usePumpFunBot } from '@/hooks/use-pumpfun'
-import { useCoinBot } from '@/hooks/use-coin'
+import { useTrendBot } from '@/hooks/use-trend'
 import { useBybitBot } from '@/hooks/use-bybit'
 
 export type BinanceBot = ReturnType<typeof useBinanceBot>
@@ -30,7 +30,7 @@ export type KrakenBot = ReturnType<typeof useKrakenBot>
 export type CurveBot = ReturnType<typeof useCurveBot>
 export type SeabotBot = ReturnType<typeof useSeabot>
 export type PumpFunBot = ReturnType<typeof usePumpFunBot>
-export type CoinBot = ReturnType<typeof useCoinBot>
+export type CoinBot = ReturnType<typeof useTrendBot>
 export type BybitBot = ReturnType<typeof useBybitBot>
 export type PaperBot = ReturnType<typeof usePaperTrading>
 export type LiveBot = ReturnType<typeof useLiveTrading>
@@ -111,8 +111,9 @@ export function BotsProvider({ children }: { children: React.ReactNode }) {
   const curve = useCurveBot()
   const seabot = useSeabot()
   const pumpfun = usePumpFunBot(wallet)
-  const coinBtc = useCoinBot('btc')
-  const coinEth = useCoinBot('eth')
+  // Bitcoin / Eth tabs run the trend-following bot (Donchian + EMA on 4h)
+  const coinBtc = useTrendBot('btc')
+  const coinEth = useTrendBot('eth')
   const bybit = useBybitBot()
 
   // Coarse primitives for the tab bar. Reading them here keeps the memo below
