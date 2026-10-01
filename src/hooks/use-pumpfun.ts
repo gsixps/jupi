@@ -1,4 +1,4 @@
-// PUMPFUN paper-trading hook â€” CLIENT-SIDE, meme-coin buy-cheap/sell-expensive.
+// PUMPFUN paper-trading hook — CLIENT-SIDE, meme-coin buy-cheap/sell-expensive.
 //
 // One tick = one strategy cycle (same skeleton as seabot / curve / coin):
 //   1. Refresh USD prices for every watched pump.fun meme coin (LIVE pump.fun
@@ -6,7 +6,7 @@
 //   2. Score each coin as an OPPORTUNITY (cheapness vs reference + momentum +
 //      new-listing bonus + liquidity penalty) and record the best.
 //   3. SELL open lots at take-profit / stop-loss / trailing-stop.
-//   4. BUY coins that are cheap & scored above the threshold â€” "buy cheap".
+//   4. BUY coins that are cheap & scored above the threshold — "buy cheap".
 //   5. Update stats + log everything.
 //
 // Capital is FICTIONAL (USD). No real on-chain trades are executed.
@@ -42,6 +42,11 @@ import type {
 } from '@/lib/pumpfun'
 import type { EquityPoint } from '@/lib/trading-types'
 import { executeRealSwap, fetchRealQuote } from '@/lib/jupiter-swap'
+import { TAKER_FEE } from '@/lib/paper-fees'
+
+/** Swap cost per side used ONLY in the explicit simulation data mode
+ *  (pool fee ≈ 0.25–1% + price impact on thin memecoin pools). */
+const SIM_SWAP_COST = 0.01
 import { getTokenBalance } from '@/lib/trading-wallet'
 import {
   clearLiveSnapshot,
@@ -73,7 +78,7 @@ export interface PumpFunConfig {
   trailingPct: number
   tickIntervalMs: number
   dataMode: 'live' | 'mock' // 'live'=real pump.fun API, 'mock'=deterministic demo
-  compound: boolean // reinvest profits â†’ per-trade budget scales with equity
+  compound: boolean // reinvest profits → per-trade budget scales with equity
   /** Trade on Solana with a connected Phantom wallet and real capital. */
   liveTrading: boolean
 }
@@ -221,7 +226,7 @@ function buildCoins(seeds: PumpCoinSeed[], now: number): PumpCoinRow[] {
 
 /** Deterministic avatar for a real coin, keyed off its mint. */
 function pumpEmoji(seed: string): string {
-  const pool = ['ðŸ¶', 'ðŸ±', 'ðŸ¸', 'ðŸš€', 'ðŸ’Ž', 'ðŸŒ™', 'âš¡', 'ðŸ”¥', 'ðŸŒ', 'ðŸ¤–', 'ðŸ‘½', 'ðŸ¢', 'ðŸŽ°', 'ðŸ§ ', 'ðŸŽ¯']
+  const pool = ['🐶', '🐱', '🐸', '🚀', '💎', '🌙', '⚡', '🔥', '🍌', '🤖', '👽', '🐢', '🎰', '🧠', '🎯']
   return pool[Math.floor(seededRandom(seed) * pool.length)]
 }
 
@@ -229,7 +234,7 @@ function pumpEmoji(seed: string): string {
  * Build rows for the REAL pump.fun universe. Prices and liquidity come from
  * Jupiter (the executable price), discovery from the pump.fun API. `refMap`
  * keeps the first price ever seen for a mint, which is the "drifted reference"
- * the cheap-entry filter compares against â€” the demo seeds cannot provide it.
+ * the cheap-entry filter compares against — the demo seeds cannot provide it.
  */
 function buildLiveCoins(
   coins: PumpApiCoin[],
@@ -357,7 +362,7 @@ export function usePumpFunBot(wallet?: UseWallet) {
         status: 'paused',
         stats: s.stats ? { ...s.stats, running: false } : s.stats,
       }))
-      log(`â›” BOT DETENIDO (live): ${reason}`, 'error')
+      log(`⛔ BOT DETENIDO (live): ${reason}`, 'error')
     },
     [log]
   )
@@ -388,7 +393,7 @@ export function usePumpFunBot(wallet?: UseWallet) {
         }
         const connection = wallet.getConnection()
         if (!connection) {
-          halt('modo live sin conexiÃ³n RPC de Solana')
+          halt('modo live sin conexión RPC de Solana')
           return
         }
         // Reconcile the real SOL balance: never size an order we cannot pay.
@@ -403,7 +408,7 @@ export function usePumpFunBot(wallet?: UseWallet) {
         }
         if (solBalance < 0.01) {
           halt(
-            `saldo SOL insuficiente: ${solBalance.toFixed(4)} SOL â€” se necesitan al menos 0.01 para operar`
+            `saldo SOL insuficiente: ${solBalance.toFixed(4)} SOL — se necesitan al menos 0.01 para operar`
           )
           return
         }
@@ -456,6 +461,17 @@ export function usePumpFunBot(wallet?: UseWallet) {
         }
       }
 
+      if (!cfg.liveTrading && cfg.dataMode === 'live') {
+        solUsd = await realTokenPriceUsd(WSOL_MINT).catch(() => 0)
+      }
+      // Demo fills come from REAL Jupiter quotes (pool fee + price impact
+      // included), exactly what the live swap would get. No quote → no fill.
+      const paperQuote = (inMint: string, inDec: number, outMint: string, outDec: number, amount: number) =>
+        fetchRealQuote(inMint, outMint, amount, SLIPPAGE_BPS, [
+          { mint: inMint, decimals: inDec, symbol: 'IN', name: 'IN' },
+          { mint: outMint, decimals: outDec, symbol: 'OUT', name: 'OUT' },
+        ]).catch(() => null)
+
       // 1b. Universe. With the real API the rows ARE the pump.fun market, so
       // each coin carries its on-chain mint. Demo mode falls back to the
       // curated fictional seeds when the API is unreachable.
@@ -496,7 +512,7 @@ export function usePumpFunBot(wallet?: UseWallet) {
               const h = stateRef.current.holdings.find((x) => x.mint === m)
               return {
                 mint: m,
-                name: h?.name ?? 'PosiciÃ³n abierta',
+                name: h?.name ?? 'Posición abierta',
                 symbol: h?.symbol ?? m.slice(0, 6),
                 decimals: h?.decimals ?? 6,
                 priceUsd: h?.currentPriceUsd ?? 0,
@@ -523,11 +539,11 @@ export function usePumpFunBot(wallet?: UseWallet) {
             liveData = true
           } else {
             liveErr = `sin precios ejecutables en Jupiter (${discovered.length} mints descubiertos)`
-            coins = cfg.liveTrading ? [] : buildCoins(PUMP_COIN_SEEDS, now)
+            coins = []
           }
         } catch (e) {
           liveErr = (e as Error).message
-          coins = cfg.liveTrading ? [] : buildCoins(PUMP_COIN_SEEDS, now)
+          coins = []
         } finally {
           clearTimeout(timer)
         }
@@ -535,11 +551,11 @@ export function usePumpFunBot(wallet?: UseWallet) {
         coins = buildCoins(PUMP_COIN_SEEDS, now)
       }
 
-      // LIVE: a dead price feed must not trade on stale data. Skip the tick and
-      // halt after repeated failures instead of falling back to the mock engine.
-      if (cfg.liveTrading && coins.length === 0) {
+      // A dead price feed must not trade on stale or simulated data — in the
+      // demo either. Skip the tick; with real money halt after repeated failures.
+      if (wantLive && coins.length === 0) {
         feedFailsRef.current += 1
-        if (feedFailsRef.current >= 3) {
+        if (cfg.liveTrading && feedFailsRef.current >= 3) {
           halt(`API de pump.fun sin datos utilizables (${liveErr ?? 'sin respuesta'}); el bot se detiene`)
           return
         }
@@ -586,12 +602,6 @@ export function usePumpFunBot(wallet?: UseWallet) {
         lastUpdatedAt: now,
       }))
 
-      if (liveErr && !liveData) {
-        log(
-          `PumpFun API no disponible (${liveErr}) — usando motor demo determinista`,
-          'warn'
-        )
-      }
 
       // 2. Build opportunity list (best candidates this scan)
       const opps: PumpOpportunity[] = []
@@ -602,12 +612,12 @@ export function usePumpFunBot(wallet?: UseWallet) {
           c.refUsd > 0 ? ((c.priceUsd - c.refUsd) / c.refUsd) * 100 : 0
         const reason =
           kind === 'new-listing'
-            ? `Nuevo listado Â· ${fmtAge(c.ageMs)} de vida Â· score ${c.score}`
+            ? `Nuevo listado · ${fmtAge(c.ageMs)} de vida · score ${c.score}`
             : kind === 'dip'
-              ? `Dip ${relPct.toFixed(1)}% vs referencia Â· score ${c.score}`
+              ? `Dip ${relPct.toFixed(1)}% vs referencia · score ${c.score}`
               : kind === 'momentum'
-                ? `Momentum +${c.momentumPct.toFixed(1)}% Â· score ${c.score}`
-                : `Oportunidad score ${c.score} Â· mcap ${fmtMcap(c.mcapUsd)}`
+                ? `Momentum +${c.momentumPct.toFixed(1)}% · score ${c.score}`
+                : `Oportunidad score ${c.score} · mcap ${fmtMcap(c.mcapUsd)}`
         opps.unshift({
           id: `ppp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           symbol: c.symbol,
@@ -625,7 +635,7 @@ export function usePumpFunBot(wallet?: UseWallet) {
           executed: false,
         })
         if (kind === 'new-listing') {
-          log(`NUEVA OPORTUNIDAD ${c.symbol}: ${kind} Â· ${reason} @ ${c.priceUsd.toFixed(6)} USD`, 'trade')
+          log(`NUEVA OPORTUNIDAD ${c.symbol}: ${kind} · ${reason} @ ${c.priceUsd.toFixed(6)} USD`, 'trade')
         }
       }
 
@@ -670,7 +680,7 @@ export function usePumpFunBot(wallet?: UseWallet) {
 
         let reason: string | null = null
         if (current >= target) {
-          reason = `Take profit +${cfg.targetPct}% (${h.symbol} subiÃ³)`
+          reason = `Take profit +${cfg.targetPct}% (${h.symbol} subió)`
         } else if (current <= stop) {
           reason = `Stop loss -${cfg.stopLossPct}%`
         } else if (
@@ -689,12 +699,12 @@ export function usePumpFunBot(wallet?: UseWallet) {
               return
             }
             if (!h.mint || !isValidMint(h.mint)) {
-              halt(`no se puede cerrar ${h.symbol} en real: la posiciÃ³n no tiene un mint on-chain vÃ¡lido`)
+              halt(`no se puede cerrar ${h.symbol} en real: la posición no tiene un mint on-chain válido`)
               return
             }
             const connection = wallet.getConnection()
             if (!connection) {
-              halt('modo live sin conexiÃ³n RPC de Solana')
+              halt('modo live sin conexión RPC de Solana')
               return
             }
             const decimals = h.decimals && h.decimals > 0 ? h.decimals : 6
@@ -726,7 +736,7 @@ export function usePumpFunBot(wallet?: UseWallet) {
                 ]
               )
             } catch (e) {
-              halt(`cotizaciÃ³n de venta ${h.symbol} fallida: ${(e as Error).message}`)
+              halt(`cotización de venta ${h.symbol} fallida: ${(e as Error).message}`)
               return
             }
             if (!quote) {
@@ -749,7 +759,7 @@ export function usePumpFunBot(wallet?: UseWallet) {
               return
             }
             if (!exec.success) {
-              halt(`venta de ${h.symbol} no confirmada: ${exec.error ?? 'transacciÃ³n fallida'}`)
+              halt(`venta de ${h.symbol} no confirmada: ${exec.error ?? 'transacción fallida'}`)
               return
             }
             const outUsd = exec.outHuman * solUsd
@@ -773,23 +783,34 @@ export function usePumpFunBot(wallet?: UseWallet) {
               outUsd,
               pnlUsd: pnl,
               profitBps: pnlBps,
-              reason: `${reason} (real, tx ${exec.signature.slice(0, 12)}â€¦)`,
+              reason: `${reason} (real, tx ${exec.signature.slice(0, 12)}…)`,
               status: 'filled',
               createdAt: now,
             })
             log(
-              `LIVE VENTA ${h.qty.toFixed(4)} ${h.symbol} â†’ ${exec.outHuman.toFixed(6)} SOL (${outUsd >= 0 ? '+' : ''}${fmtUsdPump(outUsd, 2)} USD) Â· tx ${exec.signature.slice(0, 12)}â€¦`,
+              `LIVE VENTA ${h.qty.toFixed(4)} ${h.symbol} → ${exec.outHuman.toFixed(6)} SOL (${outUsd >= 0 ? '+' : ''}${fmtUsdPump(outUsd, 2)} USD) · tx ${exec.signature.slice(0, 12)}…`,
               'trade'
             )
             log(
-              `âš¡ InterÃ©s compuesto: capital disponible â†’ ${fmtUsdPump(cash, 2)} USD (P&L real ${pnl >= 0 ? '+' : ''}${fmtUsdPump(pnl, 2)})`,
+              `⚡ Interés compuesto: capital disponible → ${fmtUsdPump(cash, 2)} USD (P&L real ${pnl >= 0 ? '+' : ''}${fmtUsdPump(pnl, 2)})`,
               'info'
             )
             continue
           }
 
-          const sellPrice = current
-          const outUsd = sellPrice * h.qty
+          let outUsd: number
+          if (liveData && h.mint && isValidMint(h.mint) && solUsd > 0) {
+            const q = await paperQuote(h.mint, h.decimals && h.decimals > 0 ? h.decimals : 6, WSOL_MINT, SOL_DECIMALS, h.qty)
+            if (!q || !(q.outAmount > 0)) {
+              log(`⏭ ${h.symbol}: sin ruta de liquidez en Jupiter para vender — se reintenta`, 'warn')
+              continue
+            }
+            outUsd = (q.outAmount / 10 ** SOL_DECIMALS) * solUsd * (1 - TAKER_FEE.jupiterNetwork)
+          } else {
+            // explicit simulation mode: flat swap cost
+            outUsd = current * h.qty * (1 - SIM_SWAP_COST)
+          }
+          const sellPrice = outUsd / h.qty
           const inputUsd = h.buyPriceUsd * h.qty
           const pnl = outUsd - inputUsd
           const pnlBps = Math.round((pnl / inputUsd) * 10000)
@@ -831,12 +852,12 @@ export function usePumpFunBot(wallet?: UseWallet) {
             executed: true,
           }
           log(
-            `VENDIDO ${h.symbol} ${sellPrice.toFixed(6)} USD (${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} USD, ${pnlBps >= 0 ? '+' : ''}${pnlBps}bps) â€” ${reason}`,
+            `VENDIDO ${h.symbol} ${sellPrice.toFixed(6)} USD (${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} USD, ${pnlBps >= 0 ? '+' : ''}${pnlBps}bps) — ${reason}`,
             'trade'
           )
           if (cfg.compound) {
             log(
-              `âš¡ InterÃ©s compuesto: capital disponible â†’ ${fmtUsdPump(cash, 2)} USD (P&L ${pnl >= 0 ? '+' : ''}${fmtUsdPump(pnl, 2)})`,
+              `⚡ Interés compuesto: capital disponible → ${fmtUsdPump(cash, 2)} USD (P&L ${pnl >= 0 ? '+' : ''}${fmtUsdPump(pnl, 2)})`,
               'info'
             )
           }
@@ -845,7 +866,7 @@ export function usePumpFunBot(wallet?: UseWallet) {
         }
       }
 
-      // 4. BUY cheap coins â€” scored opportunities
+      // 4. BUY cheap coins — scored opportunities
       const openCount = holdings.filter((h) => h.status === 'open').length
       const investedBeforePump = holdings
         .filter((h) => h.status === 'open')
@@ -867,7 +888,7 @@ export function usePumpFunBot(wallet?: UseWallet) {
         if (spend < 0.01) break
         const qty = spend / c.priceUsd
 
-        // LIVE: swap SOL â†’ coin through Jupiter. Only coins with a real mint
+        // LIVE: swap SOL → coin through Jupiter. Only coins with a real mint
         // can be traded; the demo universe is fictional.
         if (cfg.liveTrading) {
           if (!wallet || !wallet.connected || !wallet.publicKey) {
@@ -876,20 +897,20 @@ export function usePumpFunBot(wallet?: UseWallet) {
           }
           if (!isValidMint(c.mint)) {
             log(
-              `â­ ${c.symbol}: sin mint on-chain vÃ¡lido (${c.mint || 'desconocido'}) â€” no se puede comprar en real`,
+              `⏭ ${c.symbol}: sin mint on-chain válido (${c.mint || 'desconocido'}) — no se puede comprar en real`,
               'warn'
             )
             continue
           }
           const connection = wallet.getConnection()
           if (!connection) {
-            halt('modo live sin conexiÃ³n RPC de Solana')
+            halt('modo live sin conexión RPC de Solana')
             return
           }
           const decimals = c.decimals > 0 ? c.decimals : 6
           const spendSol = spend / solUsd
           if (!(spendSol > 0)) {
-            log(`â­ ${c.symbol}: ${fmtUsdPump(spend, 2)} USD no alcanza una fracciÃ³n de lamport`, 'warn')
+            log(`⏭ ${c.symbol}: ${fmtUsdPump(spend, 2)} USD no alcanza una fracción de lamport`, 'warn')
             continue
           }
           let quote
@@ -910,11 +931,11 @@ export function usePumpFunBot(wallet?: UseWallet) {
               ]
             )
           } catch (e) {
-            halt(`cotizaciÃ³n de compra ${c.symbol} fallida: ${(e as Error).message}`)
+            halt(`cotización de compra ${c.symbol} fallida: ${(e as Error).message}`)
             return
           }
           if (!quote) {
-            log(`â­ ${c.symbol}: sin ruta de liquidez SOL â†’ ${c.symbol}`, 'warn')
+            log(`⏭ ${c.symbol}: sin ruta de liquidez SOL → ${c.symbol}`, 'warn')
             continue
           }
           let exec
@@ -933,12 +954,12 @@ export function usePumpFunBot(wallet?: UseWallet) {
             return
           }
           if (!exec.success) {
-            halt(`compra de ${c.symbol} no confirmada: ${exec.error ?? 'transacciÃ³n fallida'}`)
+            halt(`compra de ${c.symbol} no confirmada: ${exec.error ?? 'transacción fallida'}`)
             return
           }
           const realQty = exec.outHuman
           if (!(realQty > 0)) {
-            halt(`compra de ${c.symbol} devolviÃ³ 0 tokens`)
+            halt(`compra de ${c.symbol} devolvió 0 tokens`)
             return
           }
           const unitPrice = spend / realQty
@@ -971,7 +992,7 @@ export function usePumpFunBot(wallet?: UseWallet) {
             outUsd: spend,
             pnlUsd: 0,
             profitBps: 0,
-            reason: `Op. score ${c.score} Â· ${c.symbol} barato (${fmtMcap(c.mcapUsd)} mcap) [real, tx ${exec.signature.slice(0, 12)}â€¦]`,
+            reason: `Op. score ${c.score} · ${c.symbol} barato (${fmtMcap(c.mcapUsd)} mcap) [real, tx ${exec.signature.slice(0, 12)}…]`,
             status: 'filled',
             createdAt: now,
           })
@@ -979,25 +1000,41 @@ export function usePumpFunBot(wallet?: UseWallet) {
           buys++
           openSymbols.add(c.symbol)
           log(
-            `LIVE COMPRA ${realQty.toFixed(4)} ${c.symbol} por ${fmtUsdPump(spend, 2)} USD (score ${c.score}) Â· tx ${exec.signature.slice(0, 12)}â€¦`,
+            `LIVE COMPRA ${realQty.toFixed(4)} ${c.symbol} por ${fmtUsdPump(spend, 2)} USD (score ${c.score}) · tx ${exec.signature.slice(0, 12)}…`,
             'trade'
           )
           continue
         }
 
+        let paperQty: number
+        const paperDecimals = c.decimals > 0 ? c.decimals : 6
+        if (liveData && isValidMint(c.mint) && solUsd > 0) {
+          const q = await paperQuote(WSOL_MINT, SOL_DECIMALS, c.mint, paperDecimals, (spend * (1 - TAKER_FEE.jupiterNetwork)) / solUsd)
+          if (!q || !(q.outAmount > 0)) {
+            log(`⏭ ${c.symbol}: sin ruta de liquidez en Jupiter — no se simula la compra`, 'warn')
+            continue
+          }
+          paperQty = q.outAmount / 10 ** paperDecimals
+        } else {
+          paperQty = (spend * (1 - SIM_SWAP_COST)) / c.priceUsd
+        }
+        if (!(paperQty > 0)) continue
+        const paperUnit = spend / paperQty
         holdings.unshift({
           id: `pph_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           coinId: c.id,
           symbol: c.symbol,
           name: c.name,
           emoji: c.emoji,
-          qty,
-          buyPriceUsd: c.priceUsd,
+          qty: paperQty,
+          buyPriceUsd: paperUnit,
           currentPriceUsd: c.priceUsd,
           peakPriceUsd: c.priceUsd,
           buyPair: 'pump.fun',
           status: 'open',
           boughtAt: now,
+          mint: isValidMint(c.mint) ? c.mint : undefined,
+          decimals: paperDecimals,
         })
         trades.unshift({
           id: `ppt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -1005,13 +1042,13 @@ export function usePumpFunBot(wallet?: UseWallet) {
           symbol: c.symbol,
           name: c.name,
           emoji: c.emoji,
-          qty,
-          priceUsd: c.priceUsd,
+          qty: paperQty,
+          priceUsd: paperUnit,
           inputUsd: spend,
           outUsd: spend,
           pnlUsd: 0,
           profitBps: 0,
-          reason: `Op. score ${c.score} Â· ${c.symbol} barato (${fmtMcap(c.mcapUsd)} mcap)`,
+          reason: `Op. score ${c.score} · ${c.symbol} barato (${fmtMcap(c.mcapUsd)} mcap)`,
           status: 'filled',
           createdAt: now,
         })
@@ -1019,7 +1056,7 @@ export function usePumpFunBot(wallet?: UseWallet) {
         buys++
         openSymbols.add(c.symbol)
         log(
-          `COMPRANDO ${c.symbol} @ ${c.priceUsd.toFixed(8)} USD (${spend.toFixed(2)} USD, score ${c.score}) â€” ${c.name}`,
+          `COMPRANDO ${c.symbol} @ ${c.priceUsd.toFixed(8)} USD (${spend.toFixed(2)} USD, score ${c.score}) — ${c.name}`,
           'trade'
         )
       }
@@ -1090,7 +1127,7 @@ export function usePumpFunBot(wallet?: UseWallet) {
 
       if (buys === 0 && opps.length === 0) {
         log(
-          `Sin oportunidades â‰¥ score ${cfg.minScore} este ciclo â€” ${scored.length} memes rastreados`,
+          `Sin oportunidades ≥ score ${cfg.minScore} este ciclo — ${scored.length} memes rastreados`,
           'info'
         )
       }
@@ -1103,7 +1140,7 @@ export function usePumpFunBot(wallet?: UseWallet) {
     const cfg = stateRef.current.config
     if (cfg.liveTrading) {
       if (!wallet || !wallet.connected || !wallet.publicKey) {
-        halt('modo live sin wallet Phantom conectada â€” conÃ©ctala antes de iniciar')
+        halt('modo live sin wallet Phantom conectada — conéctala antes de iniciar')
         return
       }
       if (!wallet.installed) {
@@ -1122,7 +1159,7 @@ export function usePumpFunBot(wallet?: UseWallet) {
     }))
     log(
       cfg.liveTrading
-        ? `PUMPFUN BOT iniciado en MODO LIVE â€” swaps reales Jupiter desde ${wallet?.shortAddress ?? 'la wallet'}`
+        ? `PUMPFUN BOT iniciado en MODO LIVE — swaps reales Jupiter desde ${wallet?.shortAddress ?? 'la wallet'}`
         : `PUMPFUN BOT iniciado - ${cfg.capitalUsd.toFixed(2)} USD ficticios, hunting meme dips & pumps`,
       'trade'
     )
