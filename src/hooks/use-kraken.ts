@@ -36,6 +36,7 @@ import {
   krakenOrderFilters,
   krakenRoundVolume,
   krakenUsdFree,
+  krakenStablesFree,
   loadCreds,
   type ExchangeCredentials,
   type ExchangeBalance,
@@ -60,6 +61,10 @@ const LIVE_MIN_SIGNAL_BPS = 100
 const LIVE_MAX_DAILY_LOSS_USD = 5
 const LIVE_MAX_CONSECUTIVE_LOSSES = 3
 const LIVE_COOLDOWN_MS = 60_000
+/** Share of free USD kept aside for taker fee (≤0.40%) + market slippage. */
+const LIVE_FUNDS_BUFFER = 0.02
+/** Kraken's smallest order cost on USD pairs (costmin 0.5). */
+const LIVE_MIN_ORDER_USD = 0.5
 
 // Hard safety gate: the current repository does NOT yet implement an atomic
 // three-leg Kraken execution with rollback/reconciliation for every leg.
@@ -421,6 +426,14 @@ export function useKrakenBot() {
           halt(`no se pudo leer el saldo real: ${(e as Error).message}`)
           return
         }
+        const stables = krakenStablesFree(bals)
+        if (cash < LIVE_MIN_ORDER_USD && stables >= LIVE_MIN_ORDER_USD) {
+          halt(
+            `tu saldo está en USDT/USDC (${stables.toFixed(2)}), pero el bot opera pares en USD (ZUSD: ${cash.toFixed(2)}). ` +
+              'Convierte a USD en Kraken (Comprar/Convertir → USD) y vuelve a arrancar.'
+          )
+          return
+        }
 
         // The exchange decides the quantities. A refresh, a manual sell or a
         // partial fill all end up here.
@@ -694,9 +707,6 @@ export function useKrakenBot() {
             continue
           }
 
-          // Never let the configurable/paper budget become a large real order.
-          const liveNotional = Math.min(notional, LIVE_MAX_ORDER_USD)
-
           // Re-read Kraken immediately before every real BUY.
           let realUsdFree = 0
           try {
@@ -705,8 +715,18 @@ export function useKrakenBot() {
             halt(`no se pudo comprobar el saldo real antes de BUY: ${(e as Error).message}`)
             return
           }
-          if (realUsdFree + 1e-9 < liveNotional) {
-            halt(`saldo real insuficiente: ${realUsdFree.toFixed(2)} USD libres; orden prevista ${liveNotional.toFixed(2)} USD`)
+          // A market BUY needs volume × ask + taker fee (fciq) + slippage.
+          // Sizing at 100% of the free USD with the LAST price is what made
+          // Kraken answer EOrder:Insufficient funds.
+          const spendable = realUsdFree * (1 - LIVE_FUNDS_BUFFER)
+          // Never let the configurable/paper budget become a large real order,
+          // and never spend more than the capital the user set for live mode.
+          const liveNotional = Math.min(notional, LIVE_MAX_ORDER_USD, cfg.capitalUsd, spendable)
+          if (liveNotional < LIVE_MIN_ORDER_USD) {
+            halt(
+              `saldo USD insuficiente para operar: ${realUsdFree.toFixed(2)} USD libres, capital ${cfg.capitalUsd.toFixed(2)} USD. ` +
+                `Kraken exige ~${LIVE_MIN_ORDER_USD} USD mínimo por orden y la mayoría de pares piden más (ETH ≈ 0.001, SOL ≈ 0.06).`
+            )
             return
           }
 

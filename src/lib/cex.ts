@@ -491,7 +491,7 @@ export async function krakenPreflight(
 
 /**
  * Free USD balance on Kraken. The REST API names fiat USD `ZUSD` and also
- * exposes a `USD` alias, so accept either (or the USDT/USDC stables) and sum
+ * exposes a `USD` alias, so accept either and return
  * the first one that actually holds funds.
  */
 export function krakenUsdFree(balances: ExchangeBalance[]): number {
@@ -502,7 +502,17 @@ export function krakenUsdFree(balances: ExchangeBalance[]): number {
     }
     return 0
   }
-  return find(["ZUSD", "USD"]) || find(["USDT", "USDC"])
+  // USD only: every live order is placed on a USD-quoted pair (XXRPZUSD, SOLUSD…),
+  // which spends ZUSD. Counting USDT/USDC as cash made the bot size orders
+  // with money the pair cannot use → EOrder:Insufficient funds.
+  return find(["ZUSD", "USD"])
+}
+
+/** USDT + USDC held on Kraken — cannot pay for orders on USD pairs. */
+export function krakenStablesFree(balances: ExchangeBalance[]): number {
+  return balances
+    .filter((b) => ["USDT", "USDC"].includes(b.symbol.toUpperCase()))
+    .reduce((a, b) => a + (b.free > 0 ? b.free : 0), 0)
 }
 
 // ================= shared helpers (real mode) =================
