@@ -13,6 +13,7 @@ import {
   Anchor,
   Building2,
   PiggyBank,
+  Landmark,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useBotStatusContext, type BotStatusMap } from '@/components/trading/BotsProvider'
@@ -48,7 +49,9 @@ export function BotTabs() {
                     ? 'bybit'
                     : pathname === '/dashboard/carry'
                       ? 'carry'
-                      : 'jupiter'
+                      : pathname === '/dashboard/gold'
+                        ? 'gold'
+                        : 'jupiter'
 
   const running = Object.values(status).filter((s) => s.running).length
   const liveCount = Object.values(status).filter((s) => s.running && s.real).length
@@ -102,6 +105,10 @@ export function BotTabs() {
         <TabLink href="/dashboard/carry" base={base} active={current === 'carry'} status={status.carry}>
           <PiggyBank className="size-3.5" />
           Rendimiento
+        </TabLink>
+        <TabLink href="/dashboard/gold" base={base} active={current === 'gold'} status={status.gold}>
+          <Landmark className="size-3.5" />
+          Oro
         </TabLink>
       </div>
 

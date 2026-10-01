@@ -40,6 +40,9 @@ export interface TrendParams {
   feeRate: number
   /** assumed slippage per fill, fraction */
   slippage: number
+  /** cost of HOLDING the position, per year, as a fraction of its value
+   *  (CFD overnight financing / swap). 0 for spot crypto. */
+  holdCostPerYear?: number
 }
 
 export const DEFAULT_TREND_PARAMS: TrendParams = {
@@ -99,6 +102,11 @@ export async function fetchBinanceKlines(
 }
 
 export const INTERVAL_MS: Record<TrendInterval, number> = { '1h': 3_600_000, '4h': 14_400_000 }
+
+/** Financing charged for holding `valueUsd` during `ms`. */
+export function holdCost(valueUsd: number, ms: number, p: TrendParams): number {
+  return valueUsd * (p.holdCostPerYear ?? 0) * (ms / (365 * 86_400_000))
+}
 
 /** Drop the candle that is still forming. */
 export function closedOnly(candles: Candle[], interval: TrendInterval, now = Date.now()): Candle[] {
@@ -324,7 +332,11 @@ export function backtest(candles: Candle[], p: TrendParams, startEquity = 1000):
       pos.peakClose = Math.max(pos.peakClose, px)
       if (d.stop !== undefined) pos.stop = d.stop
     }
-    if (pos) barsIn++
+    if (pos) {
+      barsIn++
+      // overnight financing / swap of a held CFD position
+      cash -= holdCost(pos.qty * px, INTERVAL_MS[p.interval], p)
+    }
     const eqNow = cash + (pos ? pos.qty * sellFill(px, p) * (1 - p.feeRate) : 0)
     equity.push({ t: candles[i].t, equity: eqNow })
     peakEq = Math.max(peakEq, eqNow)
