@@ -1,5 +1,6 @@
 'use client'
 
+import { useEffect, useRef } from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import {
@@ -60,14 +61,16 @@ export function BotTabs() {
   const liveCount = Object.values(status).filter((s) => s.running && s.real).length
 
   const base =
-    'inline-flex h-8 flex-1 items-center justify-center gap-1.5 rounded-md px-3 text-sm font-medium transition-all sm:flex-none'
+    'inline-flex h-8 shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-md px-3 text-sm font-medium transition-all'
 
   return (
-    <div className="space-y-1">
+    // w-full + min-w-0: inside the pages's flex row the strip must be capped to
+    // the viewport, otherwise overflow-x-auto never kicks in.
+    <div className="w-full min-w-0 max-w-full space-y-1">
       <div
         role="tablist"
         aria-label="Bot"
-        className="inline-flex w-full max-w-6xl flex-wrap items-center gap-1 rounded-lg border border-border bg-muted/60 p-1 sm:w-auto sm:flex-nowrap"
+        className="flex w-full max-w-full flex-nowrap items-center gap-1 overflow-x-auto overscroll-x-contain rounded-lg border border-border bg-muted/60 p-1 [scrollbar-width:thin]"
       >
         <TabLink href="/dashboard" base={base} active={current === 'jupiter'} status={status.jupiter}>
           <Zap className="size-3.5" />
@@ -147,8 +150,15 @@ function TabLink({
   status: { running: boolean; real: boolean } | undefined
   children: React.ReactNode
 }) {
+  // 12 tabs do not fit a phone: the strip scrolls sideways, so bring the
+  // active one into view.
+  const ref = useRef<HTMLAnchorElement>(null)
+  useEffect(() => {
+    if (active) ref.current?.scrollIntoView({ inline: 'center', block: 'nearest' })
+  }, [active])
   return (
     <Link
+      ref={ref}
       role="tab"
       aria-selected={active}
       href={href}

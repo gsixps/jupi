@@ -41,7 +41,7 @@ export function Header() {
 
   return (
     <header className="sticky top-0 z-40 border-b border-border bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-      <div className="mx-auto flex w-full max-w-7xl items-center justify-between gap-3 px-4 py-3 md:px-6">
+      <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-3 px-4 py-3 md:px-6">
         <div className="flex items-center gap-3">
           <div className="flex size-9 items-center justify-center rounded-lg bg-emerald-500/15 text-emerald-400 ring-1 ring-emerald-500/30">
             <Bot className="size-5" />
@@ -56,7 +56,7 @@ export function Header() {
           </div>
         </div>
 
-        <div className="flex items-center gap-3 md:gap-4">
+        <div className="flex min-w-0 flex-wrap items-center justify-end gap-2 md:gap-4">
           {/* Equity + P&L */}
           <div className="hidden items-end gap-4 sm:flex">
             <div className="text-right">

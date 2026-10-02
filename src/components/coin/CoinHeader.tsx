@@ -36,12 +36,12 @@ interface CoinHeaderProps {
 function accentCls(accent: string, running: boolean) {
   if (accent === 'indigo') {
     return running
-      ? 'gap-1 border-indigo-500/40 bg-indigo-500/15 text-indigo-300'
-      : 'gap-1 border-zinc-500/40 bg-zinc-500/10 text-zinc-300'
+      ? 'hidden gap-1 sm:inline-flex border-indigo-500/40 bg-indigo-500/15 text-indigo-300'
+      : 'hidden gap-1 sm:inline-flex border-zinc-500/40 bg-zinc-500/10 text-zinc-300'
   }
   return running
-    ? 'gap-1 border-amber-500/40 bg-amber-500/15 text-amber-300'
-    : 'gap-1 border-zinc-500/40 bg-zinc-500/10 text-zinc-300'
+    ? 'hidden gap-1 sm:inline-flex border-amber-500/40 bg-amber-500/15 text-amber-300'
+    : 'hidden gap-1 sm:inline-flex border-zinc-500/40 bg-zinc-500/10 text-zinc-300'
 }
 
 /**
@@ -82,7 +82,7 @@ export function CoinHeader({ bot }: CoinHeaderProps) {
         accent === 'indigo' ? 'border-indigo-500/20' : 'border-amber-500/20'
       } supports-[backdrop-filter]:bg-background/60`}
     >
-      <div className="mx-auto flex w-full max-w-7xl items-center justify-between gap-3 px-4 py-3 md:px-6">
+      <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-3 px-4 py-3 md:px-6">
         {/* Left: brand */}
         <div className="flex items-center gap-3">
           <div className={`flex size-9 items-center justify-center rounded-lg ${iconCls}`}>
@@ -101,7 +101,7 @@ export function CoinHeader({ bot }: CoinHeaderProps) {
         </div>
 
         {/* Right: stats + badge + start/stop */}
-        <div className="flex items-center gap-3 md:gap-4">
+        <div className="flex min-w-0 flex-wrap items-center justify-end gap-2 md:gap-4">
           <div className="hidden items-end gap-4 sm:flex">
             <div className="text-right">
               <div className="text-[10px] uppercase tracking-wider text-muted-foreground">

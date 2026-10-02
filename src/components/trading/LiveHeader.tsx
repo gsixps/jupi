@@ -28,7 +28,7 @@ export function LiveHeader({ live, wallet }: LiveHeaderProps) {
 
   return (
     <header className="sticky top-0 z-40 border-b border-rose-500/20 bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-      <div className="mx-auto flex w-full max-w-7xl items-center justify-between gap-3 px-4 py-3 md:px-6">
+      <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-3 px-4 py-3 md:px-6">
         <div className="flex items-center gap-3">
           <div className="flex size-9 items-center justify-center rounded-lg bg-rose-500/15 text-rose-400 ring-1 ring-rose-500/30">
             <Bot className="size-5" />
@@ -43,7 +43,7 @@ export function LiveHeader({ live, wallet }: LiveHeaderProps) {
           </div>
         </div>
 
-        <div className="flex items-center gap-3 md:gap-4">
+        <div className="flex min-w-0 flex-wrap items-center justify-end gap-2 md:gap-4">
           {/* Live stats */}
           <div className="hidden items-end gap-4 sm:flex">
             <div className="text-right">
@@ -98,8 +98,8 @@ export function LiveHeader({ live, wallet }: LiveHeaderProps) {
             variant="outline"
             className={
               running
-                ? 'gap-1 border-rose-500/40 bg-rose-500/15 text-rose-300'
-                : 'gap-1 border-zinc-500/40 bg-zinc-500/10 text-zinc-300'
+                ? 'hidden gap-1 sm:inline-flex border-rose-500/40 bg-rose-500/15 text-rose-300'
+                : 'hidden gap-1 sm:inline-flex border-zinc-500/40 bg-zinc-500/10 text-zinc-300'
             }
           >
             <Zap

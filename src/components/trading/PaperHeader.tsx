@@ -60,7 +60,7 @@ export function PaperHeader({ paper }: PaperHeaderProps) {
 
   return (
     <header className="sticky top-0 z-40 border-b border-emerald-500/20 bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-      <div className="mx-auto flex w-full max-w-7xl items-center justify-between gap-3 px-4 py-3 md:px-6">
+      <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-3 px-4 py-3 md:px-6">
         {/* Left: brand */}
         <div className="flex items-center gap-3">
           <div className="flex size-9 items-center justify-center rounded-lg bg-emerald-500/15 text-emerald-400 ring-1 ring-emerald-500/30">
@@ -78,7 +78,7 @@ export function PaperHeader({ paper }: PaperHeaderProps) {
         </div>
 
         {/* Right: stats + badge + start/stop */}
-        <div className="flex items-center gap-3 md:gap-4">
+        <div className="flex min-w-0 flex-wrap items-center justify-end gap-2 md:gap-4">
           {/* Big numbers (hidden on mobile) */}
           <div className="hidden items-end gap-4 sm:flex">
             <div className="text-right">
@@ -133,8 +133,8 @@ export function PaperHeader({ paper }: PaperHeaderProps) {
             variant="outline"
             className={
               running
-                ? 'gap-1 border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
-                : 'gap-1 border-zinc-500/40 bg-zinc-500/10 text-zinc-300'
+                ? 'hidden gap-1 sm:inline-flex border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+                : 'hidden gap-1 sm:inline-flex border-zinc-500/40 bg-zinc-500/10 text-zinc-300'
             }
           >
             <FlaskConical

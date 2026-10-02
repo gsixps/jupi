@@ -41,7 +41,7 @@ export function PumpFunHeader({ bot }: PumpFunHeaderProps) {
 
   return (
     <header className="sticky top-0 z-40 border-b border-fuchsia-500/20 bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-      <div className="mx-auto flex w-full max-w-7xl items-center justify-between gap-3 px-4 py-3 md:px-6">
+      <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-3 px-4 py-3 md:px-6">
         {/* Left: brand */}
         <div className="flex items-center gap-3">
           <div className="flex size-9 items-center justify-center rounded-lg bg-fuchsia-500/15 text-fuchsia-400 ring-1 ring-fuchsia-500/30">
@@ -58,7 +58,7 @@ export function PumpFunHeader({ bot }: PumpFunHeaderProps) {
         </div>
 
         {/* Right: stats + badge + start/stop */}
-        <div className="flex items-center gap-3 md:gap-4">
+        <div className="flex min-w-0 flex-wrap items-center justify-end gap-2 md:gap-4">
           <div className="hidden items-end gap-4 sm:flex">
             <div className="text-right">
               <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Equity</div>
@@ -102,7 +102,7 @@ export function PumpFunHeader({ bot }: PumpFunHeaderProps) {
 
           <Badge
             variant="outline"
-            className={`gap-1 ${
+            className={`hidden gap-1 sm:inline-flex ${
               running
                 ? 'border-fuchsia-500/40 bg-fuchsia-500/15 text-fuchsia-300'
                 : 'border-zinc-500/40 bg-zinc-500/10 text-zinc-300'
